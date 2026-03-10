@@ -17,10 +17,10 @@ import org.matrix.TEESimulator.logging.KeyMintParameterLogger
 // Reference:
 // https://cs.android.com/android/platform/superproject/main/+/main:system/security/keystore2/src/key_parameter.rs
 data class KeyMintAttestation(
-    val keySize: Int,
     val algorithm: Int,
     val ecCurve: Int,
     val ecCurveName: String,
+    val keySize: Int,
     val origin: Int?,
     val blockMode: List<Int>,
     val padding: List<Int>,
@@ -46,11 +46,11 @@ data class KeyMintAttestation(
     constructor(
         params: Array<KeyParameter>
     ) : this(
-        // AOSP: [key_param(tag = KEY_SIZE, field = Integer)]
-        keySize = params.findInteger(Tag.KEY_SIZE) ?: 0,
-
         // AOSP: [key_param(tag = ALGORITHM, field = Algorithm)]
         algorithm = params.findAlgorithm(Tag.ALGORITHM) ?: 0,
+
+        // AOSP: [key_param(tag = KEY_SIZE, field = Integer)]
+        keySize = params.findInteger(Tag.KEY_SIZE) ?: 0,
 
         // AOSP: [key_param(tag = EC_CURVE, field = EcCurve)]
         ecCurve = params.findEcCurve(Tag.EC_CURVE) ?: 0,
@@ -105,9 +105,13 @@ data class KeyMintAttestation(
         params.forEach { KeyMintParameterLogger.logParameter(it) }
     }
 
-    fun isAttestKey(): Boolean = purpose.size == 1 && purpose.contains(KeyPurpose.ATTEST_KEY)
+    fun isAttestKey(): Boolean {
+        return purpose.size == 1 && purpose.contains(KeyPurpose.ATTEST_KEY)
+    }
 
-    fun isImportKey(): Boolean = origin == KeyOrigin.IMPORTED || origin == KeyOrigin.SECURELY_IMPORTED
+    fun isImportKey(): Boolean {
+        return origin == KeyOrigin.IMPORTED || origin == KeyOrigin.SECURELY_IMPORTED
+    }
 }
 
 // --- Private helper extension functions for parsing KeyParameter arrays ---

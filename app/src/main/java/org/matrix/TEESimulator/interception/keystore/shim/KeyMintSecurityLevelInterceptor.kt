@@ -165,6 +165,9 @@ class KeyMintSecurityLevelInterceptor(
             val metadata: KeyMetadata =
                 reply.readTypedObject(KeyMetadata.CREATOR)
                     ?: return TransactionResult.SkipTransaction
+            KeyMintAttestation(
+                metadata.authorizations?.map { it.keyParameter }?.toTypedArray() ?: emptyArray()
+            )
             val originalChain =
                 CertificateHelper.getCertificateChain(metadata)
                     ?: return TransactionResult.SkipTransaction
@@ -247,6 +250,7 @@ class KeyMintSecurityLevelInterceptor(
                 )
                 val params = data.createTypedArray(KeyParameter.CREATOR)!!
                 val parsedParams = KeyMintAttestation(params)
+                val isAttestKeyRequest = parsedParams.isAttestKey()
 
                 val challenge = parsedParams.attestationChallenge
                 if (challenge != null && challenge.size > AttestationConstants.CHALLENGE_LENGTH_LIMIT) {
@@ -291,7 +295,7 @@ class KeyMintSecurityLevelInterceptor(
                 TransactionResult.ContinueAndSkipPost
             }
             .getOrElse {
-                SystemLogger.error("Error during generateKey handling for UID $callingUid.", it)
+                SystemLogger.error("No key pair generated for UID $callingUid.", it)
                 TransactionResult.ContinueAndSkipPost
             }
     }
@@ -565,9 +569,11 @@ class KeyMintSecurityLevelInterceptor(
         }
 
         val generatedKeys = ConcurrentHashMap<KeyIdentifier, GeneratedKeyInfo>()
-        // Caches patched chains to prevent re-generation and signature inconsistencies
+        // A set to quickly identify keys that were generated for attestation purposes.
+        val attestationKeys = ConcurrentHashMap.newKeySet<KeyIdentifier>()
+        // Caches patched certificate chains to prevent re-generation and signature inconsistencies.
         private val patchedChains = ConcurrentHashMap<KeyIdentifier, Array<Certificate>>()
-        val attestationKeys: MutableSet<KeyIdentifier> = ConcurrentHashMap.newKeySet()
+        // Stores interceptors for active cryptographic operations.
         private val interceptedOperations = ConcurrentHashMap<IBinder, OperationInterceptor>()
 
         fun getGeneratedKeyResponse(keyId: KeyIdentifier): KeyEntryResponse? =
@@ -626,6 +632,10 @@ class KeyMintSecurityLevelInterceptor(
     }
 }
 
+/**
+ * Extension function to convert parsed `KeyMintAttestation` parameters back into an array of
+ * `Authorization` objects for the fake `KeyMetadata`.
+ */
 private fun KeyMintAttestation.toAuthorizations(securityLevel: Int): Array<Authorization> {
     val authList = mutableListOf<Authorization>()
 

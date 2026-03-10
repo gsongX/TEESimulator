@@ -110,23 +110,9 @@ object Keystore2Interceptor : AbstractKeystoreInterceptor() {
 
             if (isGMS || ConfigurationManager.shouldSkipUid(callingUid)) {
                 return TransactionResult.ContinueAndSkipPost
+            } else {
+                return TransactionResult.Continue
             }
-
-            return runCatching {
-                    val isBatchMode = code == LIST_ENTRIES_BATCHED_TRANSACTION
-                    if (ListEntriesHandler.cacheParameters(txId, data, isBatchMode)) {
-                        TransactionResult.Continue
-                    } else {
-                        TransactionResult.ContinueAndSkipPost
-                    }
-                }
-                .getOrElse {
-                    SystemLogger.error(
-                        "[TX_ID: $txId] Failed to parse parameters for ${transactionNames[code]!!}",
-                        it,
-                    )
-                    TransactionResult.ContinueAndSkipPost
-                }
         } else if (
             code == GET_KEY_ENTRY_TRANSACTION ||
                 code == DELETE_KEY_TRANSACTION ||
@@ -210,8 +196,12 @@ object Keystore2Interceptor : AbstractKeystoreInterceptor() {
             logTransaction(txId, "post-${transactionNames[code]!!}", callingUid, callingPid)
 
             return runCatching {
+                    val isBatchMode = code == LIST_ENTRIES_BATCHED_TRANSACTION
+                    val params =
+                        ListEntriesHandler.cacheParameters(txId, data, isBatchMode)
+                            ?: throw Exception("Abort updating entries for invalid parameters.")
                     val updatedKeyDescriptors =
-                        ListEntriesHandler.injectGeneratedKeys(txId, callingUid, reply)
+                        ListEntriesHandler.injectGeneratedKeys(txId, callingUid, params, reply)
                     InterceptorUtils.createTypedArrayReply(updatedKeyDescriptors)
                 }
                 .getOrElse {
@@ -233,9 +223,6 @@ object Keystore2Interceptor : AbstractKeystoreInterceptor() {
                 callingUid,
                 callingPid,
             )
-
-            if (!ConfigurationManager.shouldPatch(callingUid))
-                return TransactionResult.SkipTransaction
 
             runCatching {
                     val response = reply.readTypedObject(KeyEntryResponse.CREATOR)!!
@@ -262,6 +249,7 @@ object Keystore2Interceptor : AbstractKeystoreInterceptor() {
                         SystemLogger.warning(
                             "[TX_ID: $txId] Found hardware attest key ${keyId.alias} in the reply."
                         )
+                        // Attest keys that are not under our control should be overriden.
                         val keyData =
                             CertificateGenerator.generateAttestedKeyPair(
                                 callingUid,
@@ -305,6 +293,7 @@ object Keystore2Interceptor : AbstractKeystoreInterceptor() {
 
                     val originalChain = CertificateHelper.getCertificateChain(response)
 
+                    // Check if we should perform attestation patch.
                     if (originalChain == null || originalChain.size < 2) {
                         SystemLogger.info(
                             "[TX_ID: $txId] Skip patching short certificate chain of length ${originalChain?.size}."
@@ -312,6 +301,8 @@ object Keystore2Interceptor : AbstractKeystoreInterceptor() {
                         return TransactionResult.SkipTransaction
                     }
 
+                    // First, try to retrieve the already-patched chain from our cache to ensure
+                    // consistency.
                     val cachedChain = KeyMintSecurityLevelInterceptor.getPatchedChain(keyId)
 
                     val finalChain: Array<Certificate>
@@ -321,6 +312,8 @@ object Keystore2Interceptor : AbstractKeystoreInterceptor() {
                         )
                         finalChain = cachedChain
                     } else {
+                        // If no chain is cached (e.g., key existed before simulator started),
+                        // perform a live patch as a fallback. This may still be detectable.
                         SystemLogger.info(
                             "[TX_ID: $txId] No cached chain for $keyId. Performing live patch as a fallback."
                         )
