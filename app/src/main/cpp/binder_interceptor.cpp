@@ -358,6 +358,12 @@ void inspectAndRewriteTransaction(binder_transaction_data *txn_data) {
     if (txn_data->data_size > kMaxInterceptableDataSize)
         return;
 
+    // AIDL methods use codes in [FIRST_CALL_TRANSACTION, LAST_CALL_TRANSACTION] (1..0x00ffffff).
+    // System transactions (PING, INTERFACE, DUMP, SHELL_COMMAND) use codes above that range.
+    // Skip those — intercepting a ping adds measurable latency that timing detectors flag.
+    if (txn_data->code > 0x00ffffffu && txn_data->code != intercept::kBackdoorCode)
+        return;
+
     bool hijack = false;
     ThreadTransactionInfo info;
 
