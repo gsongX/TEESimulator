@@ -91,27 +91,33 @@ object AndroidDeviceUtils {
         attestationValueProvider: () -> ByteArray?,
         expectedSize: Int,
     ): ByteArray {
-        // 1. Attempt to get the value from the system property.
         getProperty(propertyName, expectedSize)?.let {
             SystemLogger.debug("Using $propertyName from system property: ${it.toHex()}")
+            persistToFile(propertyName, it)
             return it
         }
 
-        // 2. Fallback to the value from a cached TEE attestation.
         try {
             attestationValueProvider()?.let {
                 SystemLogger.debug("Using $propertyName from TEE attestation: ${it.toHex()}")
-                setProperty(propertyName, it) // Persist for consistency
+                setProperty(propertyName, it)
+                persistToFile(propertyName, it)
                 return it
             }
         } catch (e: Exception) {
             SystemLogger.error("Failed to get $propertyName from attestation.", e)
         }
 
-        // 3. As a final fallback, generate a random value.
+        readFromFile(propertyName, expectedSize)?.let {
+            SystemLogger.debug("Using $propertyName from persistent file: ${it.toHex()}")
+            setProperty(propertyName, it)
+            return it
+        }
+
         return generateRandomBytes(expectedSize).also {
             SystemLogger.debug("Using randomly generated $propertyName: ${it.toHex()}")
             setProperty(propertyName, it)
+            persistToFile(propertyName, it)
         }
     }
 
@@ -158,9 +164,36 @@ object AndroidDeviceUtils {
         }
     }
 
-    /** Generates a cryptographically random byte array of a specified length. */
     private fun generateRandomBytes(size: Int): ByteArray =
         ByteArray(size).also { ThreadLocalRandom.current().nextBytes(it) }
+
+    private val PERSIST_DIR = File("/data/adb/tricky_store")
+
+    private fun fileForProperty(propertyName: String): File = when (propertyName) {
+        "ro.boot.vbmeta.digest" -> File(PERSIST_DIR, "boot_hash.bin")
+        "ro.boot.vbmeta.public_key_digest" -> File(PERSIST_DIR, "boot_key.bin")
+        else -> File(PERSIST_DIR, "${propertyName.replace('.', '_')}.bin")
+    }
+
+    private fun persistToFile(propertyName: String, bytes: ByteArray) {
+        try {
+            fileForProperty(propertyName).writeBytes(bytes)
+        } catch (e: Exception) {
+            SystemLogger.error("Failed to persist $propertyName to file.", e)
+        }
+    }
+
+    private fun readFromFile(propertyName: String, expectedSize: Int): ByteArray? {
+        return try {
+            val file = fileForProperty(propertyName)
+            if (!file.exists()) return null
+            val bytes = file.readBytes()
+            if (bytes.size == expectedSize) bytes else null
+        } catch (e: Exception) {
+            SystemLogger.error("Failed to read $propertyName from file.", e)
+            null
+        }
+    }
 
     // --- Patch Level Properties ---
 

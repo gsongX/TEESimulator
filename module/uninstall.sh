@@ -9,3 +9,4 @@ done
 
 rm -rf "$CONFIG_DIR/persistent_keys"
 rm -f "$CONFIG_DIR/tee_status.txt"
+rm -f "$CONFIG_DIR/boot_hash.bin" "$CONFIG_DIR/boot_key.bin"

@@ -1,3 +1,12 @@
+## TEESimulator v4.1: Boot Identity Persistence
+
+Bugfix release. The vbmeta boot key digest was randomizing on every reboot, producing a different RootOfTrust in attestation certificates each boot.
+
+On devices where the kernel doesn't set `ro.boot.vbmeta.public_key_digest`, the fallback chain hit random generation every boot because `resetprop` overrides for `ro.boot.*` props don't survive reboots. Added file-based persistence (`boot_hash.bin`, `boot_key.bin`) between the TEE cache and random fallback. Once determined, boot identity values persist across reboots.
+
+Verified on Redmi 14C: second boot reads from persistent file instead of regenerating.
+
+---
 
 ## TEESimulator v4.0: Native Rust Cert Generation
 
@@ -43,6 +52,7 @@ Generated keys now survive reboots. File-backed storage with file-level locking,
 
 DuckDetector, Luna, Play Integrity, Key Attestation Demo — all passing on Redmi 14C (Android 14, Beanpod KeyMaster, KSU).
 
+---
 
 ## 🚀 Release: TEESimulator v3.2 (Hotfix)
 
