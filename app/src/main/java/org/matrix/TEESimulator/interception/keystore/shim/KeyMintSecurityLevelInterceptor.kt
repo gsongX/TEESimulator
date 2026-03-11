@@ -549,6 +549,10 @@ class KeyMintSecurityLevelInterceptor(
             val timestamps = uidKeygenTimestamps.computeIfAbsent(uid) { mutableListOf() }
             synchronized(timestamps) {
                 timestamps.removeAll { now - it > BURST_WINDOW_MS }
+                if (timestamps.isEmpty()) {
+                    uidKeygenTimestamps.remove(uid, timestamps)
+                    uidHardwareKeygenCount.remove(uid)
+                }
                 return timestamps.size
             }
         }
