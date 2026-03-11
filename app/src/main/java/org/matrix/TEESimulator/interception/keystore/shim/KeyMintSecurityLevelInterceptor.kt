@@ -250,7 +250,6 @@ class KeyMintSecurityLevelInterceptor(
                 )
                 val params = data.createTypedArray(KeyParameter.CREATOR)!!
                 val parsedParams = KeyMintAttestation(params)
-                val isAttestKeyRequest = parsedParams.isAttestKey()
 
                 val challenge = parsedParams.attestationChallenge
                 if (challenge != null && challenge.size > AttestationConstants.CHALLENGE_LENGTH_LIMIT) {

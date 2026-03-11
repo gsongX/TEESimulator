@@ -1,6 +1,6 @@
 {
 	"version": "v4.2",
-	"versionCode": 108,
+	"versionCode": 112,
 	"zipUrl": "https://github.com/gsongX/TEESimulator/releases/download/v4.2/TEESimulator-v4.2-Release.zip",
 	"changelog": "https://raw.githubusercontent.com/gsongX/TEESimulator/main/module/changelog.md"
 }
