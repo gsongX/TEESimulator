@@ -72,25 +72,6 @@ jobs:
           ver=$(grep 'val verName' app/build.gradle.kts | sed 's/.*"\(.*\)".*/\1/')
           echo "version=${ver}" >> "$GITHUB_OUTPUT"
 
-      - name: Rename ZIPs for release
-        run: |
-          RELEASE_FILE=$(find out -name "*Release*.zip" | head -1)
-          DEBUG_FILE=$(find out -name "*Debug*.zip" | head -1)
-
-          if [[ -z "$RELEASE_FILE" || -z "$DEBUG_FILE" ]]; then
-            echo "::error::Could not find release or debug ZIPs in out/"
-            ls -la out/ || echo "out/ does not exist"
-            exit 1
-          fi
-
-          mv "$RELEASE_FILE" "out/TEESimulator-${VER}-Release.zip"
-          mv "$DEBUG_FILE" "out/TEESimulator-${VER}-Debug.zip"
-
-          echo "Release: TEESimulator-${VER}-Release.zip ($(du -h "out/TEESimulator-${VER}-Release.zip" | cut -f1))"
-          echo "Debug: TEESimulator-${VER}-Debug.zip ($(du -h "out/TEESimulator-${VER}-Debug.zip" | cut -f1))"
-        env:
-          VER: ${{ steps.ver.outputs.version }}
-
       - uses: actions/upload-artifact@v4
         with:
           name: TEESimulator-release-zip
@@ -152,8 +133,8 @@ jobs:
             --title "$VER" \
             --latest \
             --notes-file /tmp/notes.md \
-            "zips/TEESimulator-${VER}-Release.zip" \
-            "zips/TEESimulator-${VER}-Debug.zip"
+            "zips/TEESimulator-*-Release.zip" \
+            "zips/TEESimulator-*-Debug.zip"
         env:
           VER: ${{ steps.ver.outputs.version }}
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
