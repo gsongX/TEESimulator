@@ -1,3 +1,12 @@
+## TEESimulator v4.4: AOSP Conformance
+
+- **Binder error reply format** — Aligned EX_SERVICE_SPECIFIC wire layout with AOSP Status.cpp, including the remote stack trace header field.
+- **Key enumeration** — Corrected list_past_alias pagination order to match AOSP database.rs semantics.
+- **KeyMetadata fields** — Generated key responses now include modificationTimeMs, Tag.ORIGIN, and normalized KeyDescriptor fields per AOSP Keystore2.
+- **Parcel handling** — hasException() preserves reply position for downstream consumers.
+
+---
+
 ## TEESimulator v4.3: Performance & Reliability
 
 - **Debug log gating** — `SystemLogger.debug()` now skipped entirely in release builds, eliminating unnecessary logcat syscalls on every intercepted transaction.
