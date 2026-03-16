@@ -317,6 +317,7 @@ class KeyMintSecurityLevelInterceptor(
         keyId: KeyIdentifier,
         isAttestKeyRequest: Boolean,
     ): TransactionResult {
+        val startNs = System.nanoTime()
         keyDescriptor.nspace = secureRandom.nextLong()
         SystemLogger.info("Generating software key for ${keyDescriptor.alias}[${keyDescriptor.nspace}].")
 
@@ -349,6 +350,10 @@ class KeyMintSecurityLevelInterceptor(
             digests = parsedParams.digest,
             isAttestationKey = isAttestKeyRequest,
         )
+
+        val elapsedMs = (System.nanoTime() - startNs) / 1_000_000
+        val delayMs = sampleTeeLatencyMs() - elapsedMs
+        if (delayMs > 0) Thread.sleep(delayMs)
 
         return InterceptorUtils.createTypedObjectReply(response.metadata)
     }
@@ -542,6 +547,9 @@ class KeyMintSecurityLevelInterceptor(
         // Sliding window: max hardware keygen permits per UID within the burst window
         private const val MAX_HW_KEYGEN_PER_WINDOW = 2
         private const val BURST_WINDOW_MS = 30_000L
+        private const val TEE_LATENCY_MEAN_MS = 55.0
+        private const val TEE_LATENCY_STDDEV_MS = 12.0
+        private const val TEE_LATENCY_FLOOR_MS = 15L
 
         private val uidHardwareKeygenCount = ConcurrentHashMap<Int, AtomicInteger>()
         private val hardwareKeygenTxIds = ConcurrentHashMap.newKeySet<Long>()
@@ -568,6 +576,11 @@ class KeyMintSecurityLevelInterceptor(
             synchronized(timestamps) {
                 timestamps.add(System.currentTimeMillis())
             }
+        }
+
+        private fun sampleTeeLatencyMs(): Long {
+            val sample = TEE_LATENCY_MEAN_MS + secureRandom.nextGaussian() * TEE_LATENCY_STDDEV_MS
+            return sample.toLong().coerceAtLeast(TEE_LATENCY_FLOOR_MS)
         }
 
         private val GENERATE_KEY_TRANSACTION =
