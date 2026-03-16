@@ -89,5 +89,5 @@ object AttestationConstants {
 
     // --- Other Constants ---
     // https://cs.android.com/android/platform/superproject/main/+/main:system/keymaster/km_openssl/attestation_record.cpp
-    const val CHALLENGE_LENGTH_LIMIT = 128 // kMaximumAttestationChallengeLength
+    const val CHALLENGE_LENGTH_LIMIT = 128
 }

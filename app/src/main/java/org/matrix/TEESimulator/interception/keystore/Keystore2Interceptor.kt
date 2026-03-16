@@ -10,6 +10,7 @@ import android.system.keystore2.KeyDescriptor
 import android.system.keystore2.KeyEntryResponse
 import java.security.SecureRandom
 import java.security.cert.Certificate
+import java.util.concurrent.ConcurrentHashMap
 import org.matrix.TEESimulator.attestation.AttestationPatcher
 import org.matrix.TEESimulator.attestation.KeyMintAttestation
 import org.matrix.TEESimulator.config.ConfigurationManager
@@ -53,6 +54,9 @@ object Keystore2Interceptor : AbstractKeystoreInterceptor() {
             }
             .associate { field -> (field.get(null) as Int) to field.name.split("_")[1] }
     }
+
+    private const val RESPONSE_KEY_NOT_FOUND = 7
+    private val deletedSoftwareKeys: MutableSet<KeyIdentifier> = ConcurrentHashMap.newKeySet()
 
     override val serviceName = "android.system.keystore2.IKeystoreService/default"
     override val processName = "keystore2"
@@ -156,14 +160,21 @@ object Keystore2Interceptor : AbstractKeystoreInterceptor() {
             val keyId = KeyIdentifier(callingUid, descriptor.alias)
 
             if (code == DELETE_KEY_TRANSACTION) {
-                if (KeyMintSecurityLevelInterceptor.getGeneratedKeyResponse(keyId) != null) {
-                    KeyMintSecurityLevelInterceptor.cleanupKeyData(keyId)
+                val wasSoftwareKey = KeyMintSecurityLevelInterceptor.getGeneratedKeyResponse(keyId) != null
+                KeyMintSecurityLevelInterceptor.cleanupKeyData(keyId)
+                if (wasSoftwareKey) {
+                    deletedSoftwareKeys.add(keyId)
                     SystemLogger.info(
                         "[TX_ID: $txId] Deleted cached keypair ${descriptor.alias}, replying with empty response."
                     )
                     return InterceptorUtils.createSuccessReply(writeResultCode = false)
                 }
                 return TransactionResult.ContinueAndSkipPost
+            }
+
+            if (keyId in deletedSoftwareKeys) {
+                SystemLogger.info("[TX_ID: $txId] Returning KEY_NOT_FOUND for deleted key ${descriptor.alias}")
+                return InterceptorUtils.createErrorReply(RESPONSE_KEY_NOT_FOUND)
             }
 
             val response =
