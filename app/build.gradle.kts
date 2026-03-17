@@ -29,7 +29,7 @@ val gitExecutor = objects.newInstance(GitExecutor::class.java)
 
 val gitCommitCount = gitExecutor.execute("git rev-list HEAD --count", rootDir).toInt()
 val gitCommitHash = gitExecutor.execute("git rev-parse --verify --short HEAD", rootDir)
-val verName = "v4.5"
+val verName = "v4.6"
 
 android {
     namespace = "org.matrix.TEESimulator"
@@ -73,7 +73,7 @@ dependencies {
 
 // --- Rust native cert gen build task ---
 val buildRustCertgen by tasks.registering(Exec::class) {
-    group = "TEESimulator Native Build"
+    group = "TEESimulator-RS Native Build"
     description = "Builds libcertgen.so via cargo-ndk for arm64-v8a."
 
     workingDir = rootProject.projectDir.resolve("native-certgen")
@@ -108,13 +108,13 @@ androidComponents {
         // --- Define output locations and file names ---
         // Stage all files in a temporary directory inside 'build' before zipping
         val tempModuleDir = project.layout.buildDirectory.dir("module/${variant.name}")
-        val zipFileName = "TEESimulator-$verName-$gitCommitCount-$gitCommitHash-$capitalized.zip"
+        val zipFileName = "TEESimulator-RS-$verName-$gitCommitCount-$capitalized.zip"
 
         // Task 1: Prepare all module files in the temporary build directory.
         // Using Sync ensures that stale files from previous runs are removed.
         val prepareModuleFilesTask =
             tasks.register<Sync>("prepareModuleFiles${capitalized}") {
-                group = "TEESimulator Module Packaging"
+                group = "TEESimulator-RS Module Packaging"
                 description = "Prepares all files for the ${variant.name} module zip."
 
                 if (isDebug) {
@@ -162,8 +162,7 @@ androidComponents {
                     // Use expand() for simple key-value replacement.
                     expand(
                         "REPLACEMEVERCODE" to gitCommitCount.toString(),
-                        "REPLACEMEVER" to
-                            "$verName ($gitCommitCount-$gitCommitHash-${variant.name})",
+                        "REPLACEMEVER" to "$verName-$gitCommitCount",
                     )
                 }
 
@@ -174,7 +173,7 @@ androidComponents {
         // Task 2: Zip the prepared files from the temporary directory.
         val zipTask =
             tasks.register<Zip>("zip${capitalized}") {
-                group = "TEESimulator Module Packaging"
+                group = "TEESimulator-RS Module Packaging"
                 description = "Creates the flashable zip for the ${variant.name} module."
                 dependsOn(prepareModuleFilesTask)
 
@@ -187,7 +186,7 @@ androidComponents {
         fun createInstallTasks(rootProvider: String, installCli: String) {
             val pushTask =
                 tasks.register<Exec>("push${rootProvider}Module${capitalized}") {
-                    group = "TEESimulator Module Installation"
+                    group = "TEESimulator-RS Module Installation"
                     description =
                         "Pushes the ${variant.name} module to the device for $rootProvider."
                     dependsOn(zipTask)
@@ -201,7 +200,7 @@ androidComponents {
 
             val installTask =
                 tasks.register<Exec>("install${rootProvider}${capitalized}") {
-                    group = "TEESimulator Module Installation"
+                    group = "TEESimulator-RS Module Installation"
                     description = "Installs the ${variant.name} module via $rootProvider."
                     dependsOn(pushTask)
                     commandLine(
@@ -214,7 +213,7 @@ androidComponents {
                 }
 
             tasks.register<Exec>("install${rootProvider}AndReboot${capitalized}") {
-                group = "TEESimulator Module Installation"
+                group = "TEESimulator-RS Module Installation"
                 description = "Installs the ${variant.name} module via $rootProvider and reboots."
                 dependsOn(installTask)
                 commandLine("adb", "reboot")

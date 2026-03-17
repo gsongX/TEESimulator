@@ -235,7 +235,7 @@ print_summary() {
 
 # --- Main ---
 echo ""
-bold "TEESimulator package pipeline"
+bold "TEESimulator-RS package pipeline"
 echo ""
 
 [[ "$BUILD_RUST" == true ]] && build_rust

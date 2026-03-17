@@ -15,7 +15,7 @@ fi
 
 # --- Version Info ---
 VERSION=$(grep_prop version "${TMPDIR}/module.prop")
-ui_print "- Installing TEESimulator $VERSION"
+ui_print "- Installing TEESimulator-RS $VERSION"
 ui_print ""
 
 # --- Architecture Handling ---

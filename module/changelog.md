@@ -1,3 +1,13 @@
+## TEESimulator-RS v4.6: Rebrand & Detection Fix
+
+- **RTT normalization rework** — Replaced Gaussian sleep (mean=55ms) with a 15ms floor fence. The old approach triggered Chunqiu Native Check 2.8 timing analysis; the floor-only approach satisfies the minimum RTT threshold without creating a detectable delay pattern.
+- **Cross-algorithm attestation** — Signing algorithm now derived from the attestation key's actual type, not the generated key's algorithm. Fixes BouncyCastle crash when signing RSA keys with EC attestation keys (Shizuku attestation flow).
+- **Device ID attestation** — Serial/IMEI/MEID/secondImei tags now flow through to software cert gen instead of blanket rejection. Only DEVICE_UNIQUE_ATTESTATION is rejected, matching AOSP keystore2 policy.
+- **Rebrand to TEESimulator-RS** — Distinguishes this fork from upstream. Version scheme simplified to v{major}.{minor}-{commitCount}.
+- **CI streamlined** — Release pipeline uses Gradle-generated filenames directly, eliminating the rename step.
+
+---
+
 ## TEESimulator v4.5: Detection Hardening
 
 Tested against [KeyDetector](https://github.com/XiaoTong6666/KeyDetector) (23-check attestation validator). All keystore-level checks now pass.
