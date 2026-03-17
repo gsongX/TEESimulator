@@ -218,7 +218,14 @@ class KeyMintSecurityLevelInterceptor(
         SystemLogger.info("[TX_ID: $txId] Creating SOFTWARE operation for KeyId $nspace.")
 
         val params = data.createTypedArray(KeyParameter.CREATOR)!!
-        val parsedParams = KeyMintAttestation(params)
+        val parsedParams = KeyMintAttestation(params).let { p ->
+            if (p.algorithm != 0) p
+            else p.copy(algorithm = when (generatedKeyInfo.keyPair.private.algorithm) {
+                "EC" -> Algorithm.EC
+                "RSA" -> Algorithm.RSA
+                else -> p.algorithm
+            })
+        }
 
         val softwareOperation = SoftwareOperation(txId, generatedKeyInfo.keyPair, parsedParams)
         val operationBinder = SoftwareOperationBinder(softwareOperation)

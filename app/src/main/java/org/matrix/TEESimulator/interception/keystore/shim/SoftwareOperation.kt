@@ -6,6 +6,7 @@ import android.hardware.security.keymint.Digest
 import android.hardware.security.keymint.KeyPurpose
 import android.hardware.security.keymint.PaddingMode
 import android.os.RemoteException
+import android.os.ServiceSpecificException
 import android.system.keystore2.IKeystoreOperation
 import java.security.KeyPair
 import java.security.Signature
@@ -17,10 +18,9 @@ import org.matrix.TEESimulator.logging.SystemLogger
 
 // A sealed interface to represent the different cryptographic operations we can perform.
 private sealed interface CryptoPrimitive {
+    fun updateAad(aadInput: ByteArray?) {}
     fun update(data: ByteArray?): ByteArray?
-
     fun finish(data: ByteArray?, signature: ByteArray?): ByteArray?
-
     fun abort()
 }
 
@@ -142,17 +142,11 @@ private class CipherPrimitive(
     override fun abort() {}
 }
 
-/**
- * A software-only implementation of a cryptographic operation. This class acts as a controller,
- * delegating to a specific cryptographic primitive based on the operation's purpose.
- */
 class SoftwareOperation(private val txId: Long, keyPair: KeyPair, params: KeyMintAttestation) {
-    // This now holds the specific strategy object (Signer, Verifier, etc.)
     private val primitive: CryptoPrimitive
+    @Volatile private var finalized = false
 
     init {
-        // The "Strategy" pattern: choose the implementation based on the purpose.
-        // For simplicity, we only consider the first purpose listed.
         val purpose = params.purpose.firstOrNull()
         val purposeName = KeyMintParameterLogger.purposeNames[purpose] ?: "UNKNOWN"
         SystemLogger.debug("[SoftwareOp TX_ID: $txId] Initializing for purpose: $purposeName.")
@@ -168,9 +162,28 @@ class SoftwareOperation(private val txId: Long, keyPair: KeyPair, params: KeyMin
             }
     }
 
+    private fun checkActive() {
+        if (finalized) throw ServiceSpecificException(KeystoreErrorCodes.invalidOperationHandle)
+    }
+
+    private fun checkInputLength(data: ByteArray?) {
+        if (data != null && data.size > MAX_RECEIVE_DATA)
+            throw ServiceSpecificException(KeystoreErrorCodes.tooMuchData)
+    }
+
+    fun updateAad(aadInput: ByteArray?) {
+        checkActive()
+        checkInputLength(aadInput)
+        primitive.updateAad(aadInput)
+    }
+
     fun update(data: ByteArray?): ByteArray? {
+        checkActive()
+        checkInputLength(data)
         try {
             return primitive.update(data)
+        } catch (e: ServiceSpecificException) {
+            throw e
         } catch (e: Exception) {
             SystemLogger.error("[SoftwareOp TX_ID: $txId] Failed to update operation.", e)
             throw e
@@ -178,38 +191,66 @@ class SoftwareOperation(private val txId: Long, keyPair: KeyPair, params: KeyMin
     }
 
     fun finish(data: ByteArray?, signature: ByteArray?): ByteArray? {
+        checkActive()
+        checkInputLength(data)
         try {
             val result = primitive.finish(data, signature)
+            finalized = true
             SystemLogger.info("[SoftwareOp TX_ID: $txId] Finished operation successfully.")
             return result
+        } catch (e: ServiceSpecificException) {
+            throw e
         } catch (e: Exception) {
             SystemLogger.error("[SoftwareOp TX_ID: $txId] Failed to finish operation.", e)
-            // Re-throw the exception so the binder can report it to the client.
             throw e
         }
     }
 
     fun abort() {
+        finalized = true
         primitive.abort()
         SystemLogger.debug("[SoftwareOp TX_ID: $txId] Operation aborted.")
     }
+
+    companion object {
+        // AOSP keystore2 operation.rs: const MAX_RECEIVE_DATA: usize = 0x8000
+        private const val MAX_RECEIVE_DATA = 0x8000
+    }
 }
 
-/** The Binder interface for our [SoftwareOperation]. */
+private object KeystoreErrorCodes {
+    val tooMuchData: Int by lazy {
+        resolveField("android.system.keystore2.ResponseCode", "TOO_MUCH_DATA", 29)
+    }
+
+    val invalidOperationHandle: Int by lazy {
+        resolveField("android.hardware.security.keymint.ErrorCode", "INVALID_OPERATION_HANDLE", -28)
+    }
+
+    private fun resolveField(className: String, fieldName: String, fallback: Int): Int =
+        runCatching {
+            Class.forName(className).getField(fieldName).getInt(null)
+        }.getOrElse {
+            SystemLogger.debug("Resolved $className.$fieldName via fallback: $fallback")
+            fallback
+        }
+}
+
 class SoftwareOperationBinder(private val operation: SoftwareOperation) :
     IKeystoreOperation.Stub() {
 
-    @Throws(RemoteException::class)
+    override fun updateAad(aadInput: ByteArray?) {
+        operation.updateAad(aadInput)
+    }
+
     override fun update(input: ByteArray?): ByteArray? {
         return operation.update(input)
     }
 
-    @Throws(RemoteException::class)
     override fun finish(input: ByteArray?, signature: ByteArray?): ByteArray? {
         return operation.finish(input, signature)
     }
 
-    @Throws(RemoteException::class)
     override fun abort() {
         operation.abort()
     }
