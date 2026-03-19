@@ -8,7 +8,6 @@ import java.math.BigInteger
 import java.security.KeyPair
 import java.security.KeyPairGenerator
 import java.security.cert.Certificate
-import java.security.cert.X509Certificate
 import java.security.spec.ECGenParameterSpec
 import java.security.spec.RSAKeyGenParameterSpec
 import java.util.Date
@@ -36,6 +35,8 @@ import org.matrix.TEESimulator.logging.SystemLogger
  */
 object CertificateGenerator {
 
+    private const val UNDEFINED_NOT_AFTER = 253402300799000L
+
     /**
      * Generates a software-based cryptographic key pair.
      *
@@ -49,7 +50,10 @@ object CertificateGenerator {
                         Algorithm.EC -> "EC" to ECGenParameterSpec(params.ecCurveName)
                         Algorithm.RSA ->
                             "RSA" to
-                                RSAKeyGenParameterSpec(params.keySize, params.rsaPublicExponent)
+                                RSAKeyGenParameterSpec(
+                                    params.keySize,
+                                    params.rsaPublicExponent ?: RSAKeyGenParameterSpec.F4,
+                                )
                         else ->
                             throw IllegalArgumentException(
                                 "Unsupported algorithm: ${params.algorithm}"
@@ -88,11 +92,9 @@ object CertificateGenerator {
                 "Attestation challenge exceeds length limit (${challenge.size} > ${AttestationConstants.CHALLENGE_LENGTH_LIMIT})"
             )
 
-        return runCatching {
+        return try {
                 val keybox = getKeyboxForAlgorithm(uid, params.algorithm)
 
-                // Determine the signing key and issuer. If an attestKey is provided, use it.
-                // Otherwise, fall back to the root key from the keybox.
                 val (signingKey, issuer) =
                     if (attestKeyAlias != null && Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
                         getAttestationKeyInfo(uid, attestKeyAlias)?.let { it.first to it.second }
@@ -101,20 +103,20 @@ object CertificateGenerator {
                         keybox.keyPair to getIssuerFromKeybox(keybox)
                     }
 
-                // Build the new leaf certificate with the simulated attestation.
                 val leafCert =
                     buildCertificate(subjectKeyPair, signingKey, issuer, params, uid, securityLevel)
 
-                // If not self-attesting, the chain is just the leaf. Otherwise, append the keybox
-                // chain.
                 if (attestKeyAlias != null) {
                     listOf(leafCert)
                 } else {
                     listOf(leafCert) + keybox.certificates
                 }
+            } catch (e: android.os.ServiceSpecificException) {
+                throw e
+            } catch (e: Exception) {
+                SystemLogger.error("Failed to generate certificate chain.", e)
+                null
             }
-            .onFailure { SystemLogger.error("Failed to generate certificate chain.", it) }
-            .getOrNull()
     }
 
     /**
@@ -128,7 +130,7 @@ object CertificateGenerator {
         params: KeyMintAttestation,
         securityLevel: Int,
     ): Pair<KeyPair, List<Certificate>>? {
-        return runCatching {
+        return try {
                 SystemLogger.info(
                     "Generating new attested key pair for alias: '$alias' (UID: $uid)"
                 )
@@ -144,11 +146,12 @@ object CertificateGenerator {
                     "Successfully generated new certificate chain for alias: '$alias'."
                 )
                 Pair(newKeyPair, chain)
+            } catch (e: android.os.ServiceSpecificException) {
+                throw e
+            } catch (e: Exception) {
+                SystemLogger.error("Failed to generate attested key pair for alias '$alias'.", e)
+                null
             }
-            .onFailure {
-                SystemLogger.error("Failed to generate attested key pair for alias '$alias'.", it)
-            }
-            .getOrNull()
     }
 
     fun getIssuerFromKeybox(keybox: KeyBox) =
@@ -163,7 +166,10 @@ object CertificateGenerator {
                 else -> throw IllegalArgumentException("Unsupported algorithm ID: $algorithm")
             }
         return KeyBoxManager.getAttestationKey(keyboxFile, algorithmName)
-            ?: throw Exception("Could not load keybox for UID $uid and algorithm $algorithmName")
+            ?: throw android.os.ServiceSpecificException(
+                -75, // ATTESTATION_KEYS_NOT_PROVISIONED
+                "No attestation key for algorithm $algorithmName in $keyboxFile",
+            )
     }
 
     /** Retrieves the key pair and issuer name for a given attestation key alias. */
@@ -214,16 +220,15 @@ object CertificateGenerator {
         securityLevel: Int,
     ): Certificate {
         val subject = params.certificateSubject ?: X500Name("CN=Android Keystore Key")
-        val leafNotAfter =
-            (signingKeyPair.public as? X509Certificate)?.notAfter
-                ?: Date(System.currentTimeMillis() + 31536000000L)
+        val notBefore = params.certificateNotBefore ?: Date(0)
+        val notAfter = params.certificateNotAfter ?: Date(UNDEFINED_NOT_AFTER)
 
         val builder =
             JcaX509v3CertificateBuilder(
                 issuer,
                 params.certificateSerial ?: BigInteger.ONE,
-                params.certificateNotBefore ?: Date(),
-                params.certificateNotAfter ?: leafNotAfter,
+                notBefore,
+                notAfter,
                 subject,
                 subjectKeyPair.public,
             )
