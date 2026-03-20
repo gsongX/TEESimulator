@@ -15,7 +15,6 @@ import java.util.concurrent.ConcurrentHashMap
 import org.matrix.TEESimulator.attestation.AttestationPatcher
 import org.matrix.TEESimulator.attestation.KeyMintAttestation
 import org.matrix.TEESimulator.config.ConfigurationManager
-import org.matrix.TEESimulator.interception.keystore.shim.GeneratedKeyPersistence
 import org.matrix.TEESimulator.interception.keystore.shim.KeyMintSecurityLevelInterceptor
 import org.matrix.TEESimulator.logging.KeyMintParameterLogger
 import org.matrix.TEESimulator.logging.SystemLogger
@@ -58,8 +57,7 @@ object Keystore2Interceptor : AbstractKeystoreInterceptor() {
             .associate { field -> (field.get(null) as Int) to field.name.split("_")[1] }
     }
 
-    private const val RESPONSE_KEY_NOT_FOUND = 7
-    private val deletedSoftwareKeys: MutableSet<KeyIdentifier> = ConcurrentHashMap.newKeySet()
+    // Keys whose certs were updated via updateSubcomponent; skip re-patching on getKeyEntry.
     private val userUpdatedKeys = ConcurrentHashMap.newKeySet<KeyIdentifier>()
 
     override val serviceName = "android.system.keystore2.IKeystoreService/default"
@@ -100,7 +98,6 @@ object Keystore2Interceptor : AbstractKeystoreInterceptor() {
                         interceptor,
                         KeyMintSecurityLevelInterceptor.INTERCEPTED_CODES,
                     )
-                    interceptor.loadPersistedKeys()
                 }
             }
             .onFailure { SystemLogger.error("Failed to intercept TEE SecurityLevel.", it) }
@@ -117,7 +114,6 @@ object Keystore2Interceptor : AbstractKeystoreInterceptor() {
                         interceptor,
                         KeyMintSecurityLevelInterceptor.INTERCEPTED_CODES,
                     )
-                    interceptor.loadPersistedKeys()
                 }
             }
             .onFailure { SystemLogger.error("Failed to intercept StrongBox SecurityLevel.", it) }
@@ -145,23 +141,9 @@ object Keystore2Interceptor : AbstractKeystoreInterceptor() {
 
             if (isGMS || ConfigurationManager.shouldSkipUid(callingUid)) {
                 return TransactionResult.ContinueAndSkipPost
+            } else {
+                return TransactionResult.Continue
             }
-
-            return runCatching {
-                    val isBatchMode = code == LIST_ENTRIES_BATCHED_TRANSACTION
-                    if (ListEntriesHandler.cacheParameters(txId, data, isBatchMode)) {
-                        TransactionResult.Continue
-                    } else {
-                        TransactionResult.ContinueAndSkipPost
-                    }
-                }
-                .getOrElse {
-                    SystemLogger.error(
-                        "[TX_ID: $txId] Failed to parse parameters for ${transactionNames[code]!!}",
-                        it,
-                    )
-                    TransactionResult.ContinueAndSkipPost
-                }
         } else if (
             code == GET_KEY_ENTRY_TRANSACTION ||
                 code == DELETE_KEY_TRANSACTION ||
@@ -181,6 +163,7 @@ object Keystore2Interceptor : AbstractKeystoreInterceptor() {
                     ?: return TransactionResult.ContinueAndSkipPost
 
             if (code == DELETE_KEY_TRANSACTION) {
+                // Handle delete by alias (APP domain) or nspace (KEY_ID domain).
                 val keyId =
                     if (descriptor.alias != null) {
                         KeyIdentifier(callingUid, descriptor.alias)
@@ -199,7 +182,6 @@ object Keystore2Interceptor : AbstractKeystoreInterceptor() {
                         KeyMintSecurityLevelInterceptor.generatedKeys.containsKey(keyId)
                     KeyMintSecurityLevelInterceptor.cleanupKeyData(keyId)
                     if (isSoftwareKey) {
-                        deletedSoftwareKeys.add(keyId)
                         SystemLogger.info(
                             "[TX_ID: $txId] Deleted cached keypair ${keyId.alias}, replying with empty response."
                         )
@@ -214,14 +196,9 @@ object Keystore2Interceptor : AbstractKeystoreInterceptor() {
             }
             val keyId = KeyIdentifier(callingUid, descriptor.alias)
 
-            val response = KeyMintSecurityLevelInterceptor.getGeneratedKeyResponse(keyId)
-            if (response == null) {
-                if (deletedSoftwareKeys.remove(keyId)) {
-                    SystemLogger.info("[TX_ID: $txId] Returning KEY_NOT_FOUND for deleted key ${descriptor.alias}")
-                    return InterceptorUtils.createErrorReply(RESPONSE_KEY_NOT_FOUND)
-                }
-                return TransactionResult.Continue
-            }
+            val response =
+                KeyMintSecurityLevelInterceptor.getGeneratedKeyResponse(keyId)
+                    ?: return TransactionResult.Continue
 
             if (KeyMintSecurityLevelInterceptor.isAttestationKey(keyId))
                 SystemLogger.info("${descriptor.alias} was an attestation key")
@@ -282,8 +259,12 @@ object Keystore2Interceptor : AbstractKeystoreInterceptor() {
             logTransaction(txId, "post-${transactionNames[code]!!}", callingUid, callingPid)
 
             return runCatching {
+                    val isBatchMode = code == LIST_ENTRIES_BATCHED_TRANSACTION
+                    val params =
+                        ListEntriesHandler.cacheParameters(txId, data, isBatchMode)
+                            ?: throw Exception("Abort updating entries for invalid parameters.")
                     val updatedKeyDescriptors =
-                        ListEntriesHandler.injectGeneratedKeys(txId, callingUid, reply)
+                        ListEntriesHandler.injectGeneratedKeys(txId, callingUid, params, reply)
                     InterceptorUtils.createTypedArrayReply(updatedKeyDescriptors)
                 }
                 .getOrElse {
@@ -306,13 +287,11 @@ object Keystore2Interceptor : AbstractKeystoreInterceptor() {
                 callingPid,
             )
 
-            if (!ConfigurationManager.shouldPatch(callingUid))
-                return TransactionResult.SkipTransaction
-
             runCatching {
                     val response = reply.readTypedObject(KeyEntryResponse.CREATOR)!!
                     val keyId = KeyIdentifier(callingUid, keyDescriptor.alias)
 
+                    // Skip patching for keys whose certs were explicitly set via updateSubcomponent.
                     if (userUpdatedKeys.remove(keyId)) {
                         SystemLogger.debug("[TX_ID: $txId] Skipping cert patch for user-updated key $keyId.")
                         return TransactionResult.SkipTransaction
@@ -324,26 +303,13 @@ object Keystore2Interceptor : AbstractKeystoreInterceptor() {
                             authorizations?.map { it.keyParameter }?.toTypedArray() ?: emptyArray()
                         )
 
-                    if (parsedParameters.isImportKey()) {
-                        val retainedChain = KeyMintSecurityLevelInterceptor.getPatchedChain(keyId)
-                        if (retainedChain == null) {
-                            SystemLogger.info("[TX_ID: $txId] Skip patching for imported key (no prior attestation).")
-                            return TransactionResult.SkipTransaction
-                        }
-                        SystemLogger.info("[TX_ID: $txId] Imported key overwrote attested alias, serving retained chain for $keyId")
-                        CertificateHelper.updateCertificateChain(response.metadata, retainedChain).getOrThrow()
-                        return InterceptorUtils.createTypedObjectReply(response)
-                    }
-
-                    if (KeyMintSecurityLevelInterceptor.importedKeys.contains(keyId)) {
-                        SystemLogger.debug("[TX_ID: $txId] Skipping attest-key override for imported key $keyId")
-                        return TransactionResult.SkipTransaction
-                    }
-
-                    if (parsedParameters.isAttestKey()) {
+                    if (parsedParameters.isAttestKey() &&
+                        !KeyMintSecurityLevelInterceptor.importedKeys.contains(keyId)
+                    ) {
                         SystemLogger.warning(
                             "[TX_ID: $txId] Found hardware attest key ${keyId.alias} in the reply."
                         )
+                        // Attest keys that are not under our control should be overriden.
                         val keyData =
                             CertificateGenerator.generateAttestedKeyPair(
                                 callingUid,
@@ -375,26 +341,12 @@ object Keystore2Interceptor : AbstractKeystoreInterceptor() {
                                 parsedParameters,
                             )
                         KeyMintSecurityLevelInterceptor.attestationKeys.add(keyId)
-
-                        GeneratedKeyPersistence.save(
-                            keyId = keyId,
-                            keyPair = keyData.first,
-                            nspace = newNspace,
-                            securityLevel = response.metadata.keySecurityLevel,
-                            certChain = keyData.second,
-                            algorithm = parsedParameters.algorithm,
-                            keySize = parsedParameters.keySize,
-                            ecCurve = parsedParameters.ecCurve ?: 0,
-                            purposes = parsedParameters.purpose,
-                            digests = parsedParameters.digest,
-                            isAttestationKey = true,
-                        )
-
                         return InterceptorUtils.createTypedObjectReply(response)
                     }
 
                     val originalChain = CertificateHelper.getCertificateChain(response)
 
+                    // Check if we should perform attestation patch.
                     if (originalChain == null || originalChain.size < 2) {
                         SystemLogger.info(
                             "[TX_ID: $txId] Skip patching short certificate chain of length ${originalChain?.size}."
@@ -402,6 +354,8 @@ object Keystore2Interceptor : AbstractKeystoreInterceptor() {
                         return TransactionResult.SkipTransaction
                     }
 
+                    // First, try to retrieve the already-patched chain from our cache to ensure
+                    // consistency.
                     val cachedChain = KeyMintSecurityLevelInterceptor.getPatchedChain(keyId)
 
                     val finalChain: Array<Certificate>
@@ -411,12 +365,16 @@ object Keystore2Interceptor : AbstractKeystoreInterceptor() {
                         )
                         finalChain = cachedChain
                     } else {
+                        // If no chain is cached (e.g., key existed before simulator started),
+                        // perform a live patch as a fallback. This may still be detectable.
                         SystemLogger.info(
                             "[TX_ID: $txId] No cached chain for $keyId. Performing live patch as a fallback."
                         )
                         finalChain =
                             AttestationPatcher.patchCertificateChain(originalChain, callingUid)
+
                         KeyMintSecurityLevelInterceptor.patchedChains[keyId] = finalChain
+                        SystemLogger.debug("Cached patched certificate chain for $keyId.")
                     }
 
                     CertificateHelper.updateCertificateChain(response.metadata, finalChain)
@@ -445,11 +403,13 @@ object Keystore2Interceptor : AbstractKeystoreInterceptor() {
         val descriptor = data.readTypedObject(KeyDescriptor.CREATOR)
             ?: return TransactionResult.ContinueAndSkipPost
 
+        // Resolve by nspace (KEY_ID) or alias (APP), same as createOperation.
         val generatedKeyInfo =
             when (descriptor.domain) {
                 Domain.KEY_ID ->
                     KeyMintSecurityLevelInterceptor.findGeneratedKeyByKeyId(
-                        callingUid, descriptor.nspace
+                        callingUid,
+                        descriptor.nspace,
                     )
                 Domain.APP ->
                     descriptor.alias?.let {
@@ -459,6 +419,7 @@ object Keystore2Interceptor : AbstractKeystoreInterceptor() {
             }
 
         if (generatedKeyInfo == null) {
+            // Hardware key: mark so getKeyEntry skips cert re-patching.
             descriptor.alias?.let { userUpdatedKeys.add(KeyIdentifier(callingUid, it)) }
             return TransactionResult.ContinueAndSkipPost
         }
@@ -470,9 +431,6 @@ object Keystore2Interceptor : AbstractKeystoreInterceptor() {
 
         metadata.certificate = publicCert
         metadata.certificateChain = certificateChain
-
-        GeneratedKeyPersistence.rePersistIfNeeded(callingUid, generatedKeyInfo)
-
         SystemLogger.verbose(
             "Key updated with sizes: [publicCert, certificateChain] = [${publicCert?.size}, ${certificateChain?.size}]"
         )

@@ -65,6 +65,7 @@ object ConfigurationManager {
         // Initial load of all configuration files.
         loadTargetPackages(File(configRoot, TARGET_PACKAGES_FILE))
         loadPatchLevelConfig(File(configRoot, PATCH_LEVEL_FILE))
+
         // Start watching for any subsequent file changes.
         ConfigObserver.startWatching()
         SystemLogger.info("Configuration initialized and file observer started.")
@@ -82,6 +83,7 @@ object ConfigurationManager {
         return packages.firstNotNullOfOrNull { pkg -> packageKeyboxes[pkg] } ?: DEFAULT_KEYBOX_FILE
     }
 
+    /** Determines if the certificate for a given UID needs to be patched. */
     fun shouldPatch(uid: Int): Boolean {
         val mode = getPackageModeForUid(uid)
         return mode == Mode.PATCH || mode == Mode.AUTO
@@ -90,10 +92,13 @@ object ConfigurationManager {
     /** Determines if a new certificate needs to be generated for a given UID. */
     fun shouldGenerate(uid: Int): Boolean = getPackageModeForUid(uid) == Mode.GENERATE
 
+    /** Determines if no operation is needed for a given UID. */
     fun shouldSkipUid(uid: Int): Boolean = getPackageModeForUid(uid) == null
 
+    /** Determines if the UID is in AUTO mode (no explicit ! or ? suffix). */
     fun isAutoMode(uid: Int): Boolean = getPackageModeForUid(uid) == Mode.AUTO
 
+    /** Resolves the operating mode for a given UID based on its packages and the TEE status. */
     private fun getPackageModeForUid(uid: Int): Mode? {
         val packages = getPackagesForUid(uid)
         if (packages.isEmpty()) return null
@@ -151,25 +156,25 @@ object ConfigurationManager {
                     return@forEach
                 }
 
+                val mode: Mode
+                val rawPkg: String
                 when {
-                    // Suffix '!' means force GENERATE mode.
                     trimmedLine.endsWith("!") -> {
-                        val pkg = trimmedLine.removeSuffix("!").trim()
-                        newModes[pkg] = Mode.GENERATE
-                        newKeyboxes[pkg] = currentKeybox
+                        mode = Mode.GENERATE
+                        rawPkg = trimmedLine.removeSuffix("!").trim()
                     }
-                    // Suffix '?' means force PATCH mode.
                     trimmedLine.endsWith("?") -> {
-                        val pkg = trimmedLine.removeSuffix("?").trim()
-                        newModes[pkg] = Mode.PATCH
-                        newKeyboxes[pkg] = currentKeybox
+                        mode = Mode.PATCH
+                        rawPkg = trimmedLine.removeSuffix("?").trim()
                     }
-                    // No suffix means AUTO mode.
                     else -> {
-                        newModes[trimmedLine] = Mode.AUTO
-                        newKeyboxes[trimmedLine] = currentKeybox
+                        mode = Mode.AUTO
+                        rawPkg = trimmedLine
                     }
                 }
+
+                newModes[rawPkg] = mode
+                newKeyboxes[rawPkg] = currentKeybox
             }
 
             // Atomically update the configuration maps.
@@ -246,14 +251,7 @@ object ConfigurationManager {
             }
 
             // Parse global and per-package configurations.
-            var newGlobalLevel = parseLines(contextLines[""])
-            // TrickyAddon writes Pixel bulletin dates for boot/vendor but system=prop
-            // resolves to the real device prop — force boot/vendor through the same path
-            // to prevent cross-component date mismatches on non-Pixel devices.
-            if (newGlobalLevel?.system.equals("prop", ignoreCase = true)) {
-                SystemLogger.info("system=prop: forcing boot/vendor to derive from device props (were: boot=${newGlobalLevel?.boot}, vendor=${newGlobalLevel?.vendor})")
-                newGlobalLevel = newGlobalLevel?.copy(boot = "prop", vendor = "prop")
-            }
+            val newGlobalLevel = parseLines(contextLines[""])
             contextLines.remove("") // Remove global context to iterate over packages next
 
             for ((pkg, lines) in contextLines) {
@@ -284,10 +282,8 @@ object ConfigurationManager {
 
             val file = if (event != DELETE) File(configRoot, path) else null
             when (path) {
-                TARGET_PACKAGES_FILE -> file?.let { loadTargetPackages(it) }
-                    ?: SystemLogger.warning("$TARGET_PACKAGES_FILE was deleted.")
-                PATCH_LEVEL_FILE -> file?.let { loadPatchLevelConfig(it) }
-                    ?: SystemLogger.warning("$PATCH_LEVEL_FILE was deleted.")
+                TARGET_PACKAGES_FILE -> loadTargetPackages(file!!)
+                PATCH_LEVEL_FILE -> loadPatchLevelConfig(file!!)
                 // Any change to an XML file is assumed to be a keybox.
                 // The cache in KeyBoxManager will handle reloading it on its next use.
                 else ->
@@ -330,6 +326,8 @@ object ConfigurationManager {
         return iPackageManager
     }
 
+    /** Checks if any package belonging to the UID holds the given permission. */
+    /** Checks a SELinux permission for a caller identified by PID against the keystore context. */
     fun checkSELinuxPermission(callingPid: Int, tclass: String, perm: String): Boolean {
         return try {
             val callerCtx =
@@ -342,6 +340,7 @@ object ConfigurationManager {
         }
     }
 
+    /** Checks if any package belonging to the UID holds the given permission. */
     fun hasPermissionForUid(uid: Int, permission: String): Boolean {
         val userId = uid / 100000
         return getPackagesForUid(uid).any { pkg ->
@@ -353,6 +352,7 @@ object ConfigurationManager {
         }
     }
 
+    /** Retrieves the package names associated with a UID. */
     fun getPackagesForUid(uid: Int): Array<String> {
         return uidToPackagesCache.getOrPut(uid) {
             try {

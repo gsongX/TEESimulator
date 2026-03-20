@@ -1,7 +1,6 @@
 package org.matrix.TEESimulator.attestation
 
 import android.hardware.security.keymint.*
-import android.hardware.security.keymint.KeyOrigin
 import java.math.BigInteger
 import java.util.Date
 import javax.security.auth.x500.X500Principal
@@ -17,11 +16,12 @@ import org.matrix.TEESimulator.logging.KeyMintParameterLogger
 // Reference:
 // https://cs.android.com/android/platform/superproject/main/+/main:system/security/keystore2/src/key_parameter.rs
 data class KeyMintAttestation(
-    val keySize: Int,
     val algorithm: Int,
     val ecCurve: Int?,
     val ecCurveName: String,
+    val keySize: Int,
     val origin: Int?,
+    val noAuthRequired: Boolean?,
     val blockMode: List<Int>,
     val padding: List<Int>,
     val purpose: List<Int>,
@@ -41,6 +41,7 @@ data class KeyMintAttestation(
     val manufacturer: ByteArray?,
     val model: ByteArray?,
     val secondImei: ByteArray?,
+    // Enforcement tags
     val activeDateTime: Date?,
     val originationExpireDateTime: Date?,
     val usageExpireDateTime: Date?,
@@ -53,7 +54,6 @@ data class KeyMintAttestation(
     val allowWhileOnBody: Boolean?,
     val trustedUserPresenceRequired: Boolean?,
     val trustedConfirmationRequired: Boolean?,
-    val noAuthRequired: Boolean?,
     val maxUsesPerBoot: Int?,
     val maxBootLevel: Int?,
     val minMacLength: Int?,
@@ -63,10 +63,12 @@ data class KeyMintAttestation(
     constructor(
         params: Array<KeyParameter>
     ) : this(
-        keySize = params.findInteger(Tag.KEY_SIZE) ?: params.deriveKeySizeFromCurve(),
-
         // AOSP: [key_param(tag = ALGORITHM, field = Algorithm)]
         algorithm = params.findAlgorithm(Tag.ALGORITHM) ?: 0,
+
+        // AOSP: [key_param(tag = KEY_SIZE, field = Integer)]
+        // For EC keys, derive keySize from EC_CURVE when KEY_SIZE is absent.
+        keySize = params.findInteger(Tag.KEY_SIZE) ?: params.deriveKeySizeFromCurve(),
 
         // AOSP: [key_param(tag = EC_CURVE, field = EcCurve)]
         ecCurve = params.findEcCurve(Tag.EC_CURVE),
@@ -74,6 +76,9 @@ data class KeyMintAttestation(
 
         // AOSP: [key_param(tag = ORIGIN, field = Origin)]
         origin = params.findOrigin(Tag.ORIGIN),
+
+        // AOSP: [key_param(tag = NO_AUTH_REQUIRED, field = BoolValue)]
+        noAuthRequired = params.findBoolean(Tag.NO_AUTH_REQUIRED),
 
         // AOSP: [key_param(tag = BLOCK_MODE, field = BlockMode)]
         blockMode = params.findAllBlockMode(Tag.BLOCK_MODE),
@@ -116,6 +121,8 @@ data class KeyMintAttestation(
         manufacturer = params.findBlob(Tag.ATTESTATION_ID_MANUFACTURER),
         model = params.findBlob(Tag.ATTESTATION_ID_MODEL),
         secondImei = params.findBlob(Tag.ATTESTATION_ID_SECOND_IMEI),
+
+        // Enforcement tags
         activeDateTime = params.findDate(Tag.ACTIVE_DATETIME),
         originationExpireDateTime = params.findDate(Tag.ORIGINATION_EXPIRE_DATETIME),
         usageExpireDateTime = params.findDate(Tag.USAGE_EXPIRE_DATETIME),
@@ -128,7 +135,6 @@ data class KeyMintAttestation(
         allowWhileOnBody = params.findBoolean(Tag.ALLOW_WHILE_ON_BODY),
         trustedUserPresenceRequired = params.findBoolean(Tag.TRUSTED_USER_PRESENCE_REQUIRED),
         trustedConfirmationRequired = params.findBoolean(Tag.TRUSTED_CONFIRMATION_REQUIRED),
-        noAuthRequired = params.findBoolean(Tag.NO_AUTH_REQUIRED),
         maxUsesPerBoot = params.findInteger(Tag.MAX_USES_PER_BOOT),
         maxBootLevel = params.findInteger(Tag.MAX_BOOT_LEVEL),
         minMacLength = params.findInteger(Tag.MIN_MAC_LENGTH),
@@ -138,12 +144,20 @@ data class KeyMintAttestation(
         params.forEach { KeyMintParameterLogger.logParameter(it) }
     }
 
-    fun isAttestKey(): Boolean = purpose.size == 1 && purpose.contains(KeyPurpose.ATTEST_KEY)
+    fun isAttestKey(): Boolean {
+        return purpose.size == 1 && purpose.contains(KeyPurpose.ATTEST_KEY)
+    }
 
-    fun isImportKey(): Boolean = origin == KeyOrigin.IMPORTED || origin == KeyOrigin.SECURELY_IMPORTED
+    fun isImportKey(): Boolean {
+        return origin == KeyOrigin.IMPORTED || origin == KeyOrigin.SECURELY_IMPORTED
+    }
 }
 
 // --- Private helper extension functions for parsing KeyParameter arrays ---
+
+/** Maps to AOSP field = Integer */
+private fun Array<KeyParameter>.findBoolean(tag: Int): Boolean? =
+    this.find { it.tag == tag }?.value?.boolValue
 
 /** Maps to AOSP field = Integer */
 private fun Array<KeyParameter>.findInteger(tag: Int): Int? =
@@ -177,7 +191,7 @@ private fun Array<KeyParameter>.findBlob(tag: Int): ByteArray? =
 private fun Array<KeyParameter>.findAllBlockMode(tag: Int): List<Int> =
     this.filter { it.tag == tag }.map { it.value.blockMode }
 
-/** Maps to AOSP field = BlockMode (Repeated) */
+/** Maps to AOSP field = PaddingMode (Repeated) */
 private fun Array<KeyParameter>.findAllPaddingMode(tag: Int): List<Int> =
     this.filter { it.tag == tag }.map { it.value.paddingMode }
 
@@ -189,9 +203,7 @@ private fun Array<KeyParameter>.findAllKeyPurpose(tag: Int): List<Int> =
 private fun Array<KeyParameter>.findAllDigests(tag: Int): List<Int> =
     this.filter { it.tag == tag }.map { it.value.digest }
 
-private fun Array<KeyParameter>.findBoolean(tag: Int): Boolean? =
-    if (this.any { it.tag == tag }) true else null
-
+/** Derives keySize from EC_CURVE tag when KEY_SIZE is not explicitly provided. */
 private fun Array<KeyParameter>.deriveKeySizeFromCurve(): Int {
     val curveId = this.find { it.tag == Tag.EC_CURVE }?.value?.ecCurve ?: return 0
     return when (curveId) {

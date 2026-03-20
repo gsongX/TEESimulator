@@ -35,6 +35,7 @@ import org.matrix.TEESimulator.logging.SystemLogger
  */
 object CertificateGenerator {
 
+    // RFC 5280 GeneralizedTime maximum: 9999-12-31T23:59:59 UTC (millis since epoch).
     private const val UNDEFINED_NOT_AFTER = 253402300799000L
 
     /**
@@ -198,14 +199,16 @@ object CertificateGenerator {
     private fun buildKeyUsageFromPurposes(purposes: List<Int>): Int {
         var bits = 0
         for (purpose in purposes) {
-            bits = bits or when (purpose) {
-                KeyPurpose.SIGN -> KeyUsage.digitalSignature
-                KeyPurpose.DECRYPT -> KeyUsage.dataEncipherment
-                KeyPurpose.WRAP_KEY -> KeyUsage.keyEncipherment
-                KeyPurpose.AGREE_KEY -> KeyUsage.keyAgreement
-                KeyPurpose.ATTEST_KEY -> KeyUsage.keyCertSign
-                else -> 0
-            }
+            bits =
+                bits or
+                    when (purpose) {
+                        KeyPurpose.SIGN -> KeyUsage.digitalSignature
+                        KeyPurpose.DECRYPT -> KeyUsage.dataEncipherment
+                        KeyPurpose.WRAP_KEY -> KeyUsage.keyEncipherment
+                        KeyPurpose.AGREE_KEY -> KeyUsage.keyAgreement
+                        KeyPurpose.ATTEST_KEY -> KeyUsage.keyCertSign
+                        else -> 0
+                    }
         }
         return bits
     }
@@ -220,6 +223,8 @@ object CertificateGenerator {
         securityLevel: Int,
     ): Certificate {
         val subject = params.certificateSubject ?: X500Name("CN=Android Keystore Key")
+
+        // Default validity: epoch to 9999-12-31T23:59:59 UTC (matches add_required_parameters).
         val notBefore = params.certificateNotBefore ?: Date(0)
         val notAfter = params.certificateNotAfter ?: Date(UNDEFINED_NOT_AFTER)
 
@@ -243,11 +248,16 @@ object CertificateGenerator {
             AttestationBuilder.buildAttestationExtension(params, uid, securityLevel)
         )
 
+        // The signature algorithm must match the SIGNING key, not the subject key.
+        // An EC attestation key may sign an RSA subject key's certificate (or vice versa).
         val signerAlgorithm =
-            when (signingKeyPair.private.algorithm) {
-                "EC", "ECDSA" -> "SHA256withECDSA"
-                "RSA" -> "SHA256withRSA"
-                else -> throw IllegalArgumentException("Unsupported signing key: ${signingKeyPair.private.algorithm}")
+            when (signingKeyPair.private) {
+                is java.security.interfaces.ECKey -> "SHA256withECDSA"
+                is java.security.interfaces.RSAKey -> "SHA256withRSA"
+                else ->
+                    throw IllegalArgumentException(
+                        "Unsupported signing key type: ${signingKeyPair.private.javaClass}"
+                    )
             }
         val contentSigner =
             JcaContentSignerBuilder(signerAlgorithm)

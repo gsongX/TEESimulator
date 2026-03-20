@@ -17,18 +17,6 @@ data class KeyIdentifier(val uid: Int, val alias: String)
 /** A collection of utility functions to support binder interception. */
 object InterceptorUtils {
 
-    private const val EX_SERVICE_SPECIFIC = -8
-
-    fun createErrorReply(errorCode: Int): BinderInterceptor.TransactionResult.OverrideReply {
-        val parcel = Parcel.obtain().apply {
-            writeInt(EX_SERVICE_SPECIFIC)
-            writeString(null)
-            writeInt(0) // empty remote stack trace header (AOSP Status.cpp:196)
-            writeInt(errorCode)
-        }
-        return BinderInterceptor.TransactionResult.OverrideReply(parcel)
-    }
-
     /**
      * Uses reflection to get the integer transaction code for a given method name from a Stub
      * class. This is necessary for older Android versions where codes are not public constants.
@@ -130,6 +118,10 @@ object InterceptorUtils {
         return exception != null
     }
 
+    /**
+     * Creates an `OverrideReply` that writes a `ServiceSpecificException` with the given error
+     * code via EX_SERVICE_SPECIFIC.
+     */
     fun createServiceSpecificErrorReply(
         errorCode: Int
     ): BinderInterceptor.TransactionResult.OverrideReply {
@@ -140,6 +132,14 @@ object InterceptorUtils {
         return BinderInterceptor.TransactionResult.OverrideReply(parcel)
     }
 
+    /**
+     * Patches the system-level authorization values (OS_PATCHLEVEL, VENDOR_PATCHLEVEL,
+     * BOOT_PATCHLEVEL) in an authorization array to match the configured patch levels for the
+     * given calling UID. Each authorization's original [Authorization.securityLevel] is preserved.
+     *
+     * When a patch level is configured as "no" ([AndroidDeviceUtils.DO_NOT_REPORT]), the original
+     * hardware value is kept as-is.
+     */
     fun patchAuthorizations(
         authorizations: Array<Authorization>?,
         callingUid: Int,

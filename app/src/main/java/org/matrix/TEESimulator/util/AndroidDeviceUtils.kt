@@ -91,33 +91,27 @@ object AndroidDeviceUtils {
         attestationValueProvider: () -> ByteArray?,
         expectedSize: Int,
     ): ByteArray {
+        // 1. Attempt to get the value from the system property.
         getProperty(propertyName, expectedSize)?.let {
             SystemLogger.debug("Using $propertyName from system property: ${it.toHex()}")
-            persistToFile(propertyName, it)
             return it
         }
 
+        // 2. Fallback to the value from a cached TEE attestation.
         try {
             attestationValueProvider()?.let {
                 SystemLogger.debug("Using $propertyName from TEE attestation: ${it.toHex()}")
-                setProperty(propertyName, it)
-                persistToFile(propertyName, it)
+                setProperty(propertyName, it) // Persist for consistency
                 return it
             }
         } catch (e: Exception) {
             SystemLogger.error("Failed to get $propertyName from attestation.", e)
         }
 
-        readFromFile(propertyName, expectedSize)?.let {
-            SystemLogger.debug("Using $propertyName from persistent file: ${it.toHex()}")
-            setProperty(propertyName, it)
-            return it
-        }
-
+        // 3. As a final fallback, generate a random value.
         return generateRandomBytes(expectedSize).also {
             SystemLogger.debug("Using randomly generated $propertyName: ${it.toHex()}")
             setProperty(propertyName, it)
-            persistToFile(propertyName, it)
         }
     }
 
@@ -164,36 +158,9 @@ object AndroidDeviceUtils {
         }
     }
 
+    /** Generates a cryptographically random byte array of a specified length. */
     private fun generateRandomBytes(size: Int): ByteArray =
         ByteArray(size).also { ThreadLocalRandom.current().nextBytes(it) }
-
-    private val PERSIST_DIR = File("/data/adb/tricky_store")
-
-    private fun fileForProperty(propertyName: String): File = when (propertyName) {
-        "ro.boot.vbmeta.digest" -> File(PERSIST_DIR, "boot_hash.bin")
-        "ro.boot.vbmeta.public_key_digest" -> File(PERSIST_DIR, "boot_key.bin")
-        else -> File(PERSIST_DIR, "${propertyName.replace('.', '_')}.bin")
-    }
-
-    private fun persistToFile(propertyName: String, bytes: ByteArray) {
-        try {
-            fileForProperty(propertyName).writeBytes(bytes)
-        } catch (e: Exception) {
-            SystemLogger.error("Failed to persist $propertyName to file.", e)
-        }
-    }
-
-    private fun readFromFile(propertyName: String, expectedSize: Int): ByteArray? {
-        return try {
-            val file = fileForProperty(propertyName)
-            if (!file.exists()) return null
-            val bytes = file.readBytes()
-            if (bytes.size == expectedSize) bytes else null
-        } catch (e: Exception) {
-            SystemLogger.error("Failed to read $propertyName from file.", e)
-            null
-        }
-    }
 
     // --- Patch Level Properties ---
 
@@ -273,12 +240,11 @@ object AndroidDeviceUtils {
         val resolvedValue = resolveDateKeywords(value)
 
         return when {
+            // "device_default" indicates falling back to the system property.
             resolvedValue.equals("device_default", ignoreCase = true) -> null
-            // Resolve from live system prop — matches what detectors see via getprop,
-            // even when PIF has spoofed ro.build.version.security_patch via resetprop
-            resolvedValue.equals("prop", ignoreCase = true) ->
-                parsePatchLevelValue(SystemProperties.get("ro.build.version.security_patch", ""), isLong)
+            // "no" indicates this value should not be reported.
             resolvedValue.equals("no", ignoreCase = true) -> DO_NOT_REPORT
+            // Otherwise, parse the resolved date string.
             else -> parsePatchLevelValue(resolvedValue, isLong)
         }
     }
@@ -405,7 +371,10 @@ object AndroidDeviceUtils {
 
     // --- APEX and Module Hash Properties ---
 
-    // Minimal protobuf parser for apex_manifest.pb (field 1: name, field 2: version)
+    // https://cs.android.com/android/platform/superproject/+/android-latest-release:system/apex/proto/apex_manifest.proto
+    // --- Minimal Protobuf Parser for ApexManifest ---
+    // Field 1: name (string)
+    // Field 2: version (int64)
     private class MinimalApexManifestParser(private val data: ByteArray) {
         var pos = 0
 
@@ -419,13 +388,13 @@ object AndroidDeviceUtils {
                 val wireType = (tag and 0x07).toInt()
 
                 when (fieldNum) {
-                    1L -> {
+                    1L -> { // name
                         val length = readVarint().toInt()
                         if (pos + length > data.size) return null
                         name = String(data, pos, length, Charsets.UTF_8)
                         pos += length
                     }
-                    2L -> {
+                    2L -> { // version
                         version = readVarint()
                     }
                     else -> skipField(wireType)
@@ -453,18 +422,19 @@ object AndroidDeviceUtils {
 
         private fun skipField(wireType: Int) {
             when (wireType) {
-                0 -> readVarint()
-                1 -> pos += 8
-                2 -> {
+                0 -> readVarint() // Varint
+                1 -> pos += 8 // 64-bit
+                2 -> { // Length-delimited
                     val len = readVarint().toInt()
                     pos += len
                 }
-                5 -> pos += 4
+                5 -> pos += 4 // 32-bit
                 else -> throw IllegalStateException("Unknown wire type $wireType")
             }
         }
     }
 
+    // https://cs.android.com/android/platform/superproject/main/+/main:system/apex/libs/libapexutil/apexutil.cpp
     private val apexInfos: List<Pair<String, Long>> by lazy {
         val results = mutableListOf<Pair<String, Long>>()
         val apexRoot = File("/apex")
@@ -473,14 +443,22 @@ object AndroidDeviceUtils {
             return@lazy emptyList()
         }
 
+        // Logic from: GetActivePackages in apexutil.cpp
         apexRoot.listFiles()?.forEach { file ->
             if (!file.isDirectory) return@forEach
             val name = file.name
 
+            // 1. Ignore "." (and implicitly "..")
             if (name.startsWith(".")) return@forEach
+
+            // 2. Ignore directories containing '@' (active mounts usually don't have version in
+            // path)
             if (name.contains("@")) return@forEach
+
+            // 3. Ignore "sharedlibs"
             if (name == "sharedlibs") return@forEach
 
+            // 4. Parse apex_manifest.pb
             val manifestFile = File(file, "apex_manifest.pb")
             if (manifestFile.exists()) {
                 runCatching {
@@ -491,46 +469,59 @@ object AndroidDeviceUtils {
             }
         }
 
+        // Ensure uniqueness (though filesystem scan usually prevents exact dupes,
+        // strictly speaking we want to behave like a Map keyed by package name)
         results.distinctBy { it.first }
     }
 
+    // https://cs.android.com/android/platform/superproject/main/+/main:system/security/keystore2/src/maintenance.rs
     val moduleHash: ByteArray by lazy {
         DeviceAttestationService.CachedAttestationData?.moduleHash
             ?: runCatching {
+                    // 1. Create a container to hold the sort key (name encoded) and the full data
+                    // (sequence encoded)
                     data class ModuleEntry(
-                        val nameEncoded: ByteArray,
-                        val fullEncoded: ByteArray,
+                        val nameEncoded: ByteArray, // The sort key
+                        val fullEncoded: ByteArray, // The data to hash
                     )
 
                     val modules =
                         apexInfos.map { (packageName, versionCode) ->
+                            // Create the components
                             val nameOctet = DEROctetString(packageName.toByteArray(Charsets.UTF_8))
                             val versionInt = ASN1Integer(versionCode)
 
+                            // Create the Sequence: SEQUENCE { packageName, version }
                             val vec = ASN1EncodableVector()
                             vec.add(nameOctet)
                             vec.add(versionInt)
                             val sequence = DERSequence(vec)
 
-                            // AOSP sorts by encoded name only, not full sequence
+                            // We store the encoded name separately because Rust sorts ONLY by this
                             ModuleEntry(
                                 nameEncoded = nameOctet.encoded,
                                 fullEncoded = sequence.encoded,
                             )
                         }
 
+                    // 2. Sort manually based on the encoded Package Name (lexicographically)
+                    // This mimics the Rust 'impl DerOrd for ModuleInfo' which delegates to
+                    // 'self.name'
                     val sortedModules =
                         modules.sortedWith { m1, m2 ->
                             compareByteArrays(m1.nameEncoded, m2.nameEncoded)
                         }
 
+                    // 3. Concatenate the full sequences in the specific sorted order
                     val payloadStream = ByteArrayOutputStream()
                     sortedModules.forEach { payloadStream.write(it.fullEncoded) }
                     val payload = payloadStream.toByteArray()
 
-                    // Wrap in DER SET tag manually — DERSet() re-sorts by full encoding
+                    // 4. Wrap manually in a DER SET tag (0x31)
+                    // We cannot use DERSet(vector) because it would re-sort incorrectly.
                     val finalDerSet = encodeAsDerSet(payload)
 
+                    // 5. Compute SHA-256
                     MessageDigest.getInstance("SHA-256").digest(finalDerSet)
                 }
                 .getOrElse {
@@ -539,6 +530,7 @@ object AndroidDeviceUtils {
                 }
     }
 
+    /** Compares two byte arrays lexicographically (unsigned). */
     private fun compareByteArrays(a: ByteArray, b: ByteArray): Int {
         val length = minOf(a.size, b.size)
         for (i in 0 until length) {
@@ -551,25 +543,31 @@ object AndroidDeviceUtils {
         return a.size - b.size
     }
 
+    /** Manually wraps the payload in an ASN.1 SET (0x31) tag with correct length encoding. */
     private fun encodeAsDerSet(payload: ByteArray): ByteArray {
         val out = ByteArrayOutputStream()
-        out.write(0x31)
+        out.write(0x31) // ASN.1 Tag for SET
         writeDerLength(out, payload.size)
         out.write(payload)
         return out.toByteArray()
     }
 
+    /** Writes the ASN.1 length field to the stream. */
     private fun writeDerLength(out: ByteArrayOutputStream, length: Int) {
         if (length < 128) {
+            // Short form
             out.write(length)
         } else {
+            // Long form
             var size = length
             val bytes = ArrayList<Byte>()
             while (size > 0) {
                 bytes.add((size and 0xFF).toByte())
                 size = size ushr 8
             }
+            // First byte: 0x80 | number of length bytes
             out.write(0x80 or bytes.size)
+            // Write length bytes in big-endian (reverse of how we extracted them)
             for (i in bytes.indices.reversed()) {
                 out.write(bytes[i].toInt())
             }

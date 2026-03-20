@@ -29,7 +29,7 @@ val gitExecutor = objects.newInstance(GitExecutor::class.java)
 
 val gitCommitCount = gitExecutor.execute("git rev-list HEAD --count", rootDir).toInt()
 val gitCommitHash = gitExecutor.execute("git rev-parse --verify --short HEAD", rootDir)
-val verName = "v5.0"
+val verName = "v3.2"
 
 android {
     namespace = "org.matrix.TEESimulator"
@@ -71,35 +71,6 @@ dependencies {
     implementation(libs.bcpkix)
 }
 
-// --- Rust native cert gen build task ---
-val buildRustCertgen by tasks.registering(Exec::class) {
-    group = "TEESimulator-RS Native Build"
-    description = "Builds libcertgen.so via cargo-ndk for arm64-v8a."
-
-    workingDir = rootProject.projectDir.resolve("native-certgen")
-
-    commandLine(
-        "cargo", "ndk",
-        "-t", "arm64-v8a",
-        "-o", rootProject.projectDir.resolve("app/src/main/jniLibs").absolutePath,
-        "build", "--release"
-    )
-
-    inputs.dir(rootProject.projectDir.resolve("native-certgen/src"))
-    inputs.file(rootProject.projectDir.resolve("native-certgen/Cargo.toml"))
-    inputs.file(rootProject.projectDir.resolve("native-certgen/Cargo.lock"))
-    outputs.dir(rootProject.projectDir.resolve("app/src/main/jniLibs"))
-
-    environment("ANDROID_NDK_HOME", android.ndkDirectory.absolutePath)
-}
-
-// AGP auto-detects jniLibs/ as an input to mergeJniLibFolders — wire the dependency
-tasks.configureEach {
-    if (name.endsWith("JniLibFolders") && name.startsWith("merge")) {
-        dependsOn(buildRustCertgen)
-    }
-}
-
 androidComponents {
     onVariants(selector().all()) { variant ->
         val capitalized = variant.name.replaceFirstChar { it.uppercase() }
@@ -108,22 +79,21 @@ androidComponents {
         // --- Define output locations and file names ---
         // Stage all files in a temporary directory inside 'build' before zipping
         val tempModuleDir = project.layout.buildDirectory.dir("module/${variant.name}")
-        val zipFileName = "TEESimulator-RS-$verName-$gitCommitCount-$capitalized.zip"
+        val zipFileName = "TEESimulator-$verName-$gitCommitCount-$gitCommitHash-$capitalized.zip"
 
         // Task 1: Prepare all module files in the temporary build directory.
         // Using Sync ensures that stale files from previous runs are removed.
         val prepareModuleFilesTask =
             tasks.register<Sync>("prepareModuleFiles${capitalized}") {
-                group = "TEESimulator-RS Module Packaging"
+                group = "TEESimulator Module Packaging"
                 description = "Prepares all files for the ${variant.name} module zip."
 
                 if (isDebug) {
                     dependsOn("package${capitalized}")
                 } else {
                     dependsOn("minify${capitalized}WithR8")
-                    dependsOn("strip${capitalized}DebugSymbols")
                 }
-                dependsOn(buildRustCertgen)
+                dependsOn("strip${capitalized}DebugSymbols")
 
                 if (isDebug) {
                     from(variant.artifacts.get(SingleArtifact.APK)) {
@@ -140,14 +110,13 @@ androidComponents {
                     }
                 }
 
-                val nativeLibsDir = if (isDebug) {
-                    "intermediates/merged_native_libs/${variant.name}/merge${capitalized}NativeLibs/out/lib"
-                } else {
-                    "intermediates/stripped_native_libs/${variant.name}/strip${capitalized}DebugSymbols/out/lib"
-                }
-                from(project.layout.buildDirectory.dir(nativeLibsDir)) {
-                    into("lib")
-                    include("**/libinject.so", "**/libTEESimulator.so", "**/libsupervisor.so", "**/libcertgen.so")
+                from(
+                    project.layout.buildDirectory.dir(
+                        "intermediates/stripped_native_libs/${variant.name}/strip${capitalized}DebugSymbols/out/lib"
+                    )
+                ) {
+                    into("lib") // Place them in the 'lib' subfolder of the staging directory.
+                    include("**/libinject.so", "**/libTEESimulator.so")
                 }
 
                 // Now, copy and process the files from 'module' directory.
@@ -162,7 +131,8 @@ androidComponents {
                     // Use expand() for simple key-value replacement.
                     expand(
                         "REPLACEMEVERCODE" to gitCommitCount.toString(),
-                        "REPLACEMEVER" to "$verName-$gitCommitCount",
+                        "REPLACEMEVER" to
+                            "$verName ($gitCommitCount-$gitCommitHash-${variant.name})",
                     )
                 }
 
@@ -173,7 +143,7 @@ androidComponents {
         // Task 2: Zip the prepared files from the temporary directory.
         val zipTask =
             tasks.register<Zip>("zip${capitalized}") {
-                group = "TEESimulator-RS Module Packaging"
+                group = "TEESimulator Module Packaging"
                 description = "Creates the flashable zip for the ${variant.name} module."
                 dependsOn(prepareModuleFilesTask)
 
@@ -186,7 +156,7 @@ androidComponents {
         fun createInstallTasks(rootProvider: String, installCli: String) {
             val pushTask =
                 tasks.register<Exec>("push${rootProvider}Module${capitalized}") {
-                    group = "TEESimulator-RS Module Installation"
+                    group = "TEESimulator Module Installation"
                     description =
                         "Pushes the ${variant.name} module to the device for $rootProvider."
                     dependsOn(zipTask)
@@ -200,7 +170,7 @@ androidComponents {
 
             val installTask =
                 tasks.register<Exec>("install${rootProvider}${capitalized}") {
-                    group = "TEESimulator-RS Module Installation"
+                    group = "TEESimulator Module Installation"
                     description = "Installs the ${variant.name} module via $rootProvider."
                     dependsOn(pushTask)
                     commandLine(
@@ -213,7 +183,7 @@ androidComponents {
                 }
 
             tasks.register<Exec>("install${rootProvider}AndReboot${capitalized}") {
-                group = "TEESimulator-RS Module Installation"
+                group = "TEESimulator Module Installation"
                 description = "Installs the ${variant.name} module via $rootProvider and reboots."
                 dependsOn(installTask)
                 commandLine("adb", "reboot")

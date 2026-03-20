@@ -15,7 +15,7 @@ fi
 
 # --- Version Info ---
 VERSION=$(grep_prop version "${TMPDIR}/module.prop")
-ui_print "- Installing TEESimulator-RS $VERSION"
+ui_print "- Installing TEESimulator $VERSION"
 ui_print ""
 
 # --- Architecture Handling ---
@@ -48,7 +48,7 @@ install_file() {
 
 # --- Installation ---
 ui_print "- Extracting module files"
-for file in customize.sh module.prop service.sh sepolicy.rule daemon action.sh uninstall.sh; do
+for file in customize.sh module.prop service.sh sepolicy.rule daemon; do
   install_file "$file" "$MODPATH"
 done
 
@@ -67,14 +67,10 @@ ui_print ""
 ui_print "- Extracting $ARCH libraries"
 install_file "lib/$ABI_DIR/libTEESimulator.so" "$MODPATH"
 install_file "lib/$ABI_DIR/libinject.so" "$MODPATH"
-install_file "lib/$ABI_DIR/libsupervisor.so" "$MODPATH"
-install_file "lib/$ABI_DIR/libcertgen.so" "$MODPATH"
 ui_print ""
 
 mv "$MODPATH/libinject.so" "$MODPATH/inject"
-mv "$MODPATH/libsupervisor.so" "$MODPATH/supervisor"
 chmod 755 "$MODPATH/inject"
-chmod 755 "$MODPATH/supervisor"
 
 # --- Configuration Files ---
 if [ ! -d "$CONFIG_DIR" ]; then
@@ -92,6 +88,7 @@ if [ ! -f "$CONFIG_DIR/target.txt" ]; then
   install_file "target.txt" "$CONFIG_DIR"
 fi
 
+# Remove legacy TEE status file; TEE status is now determined at runtime.
 rm -f "$CONFIG_DIR/tee_status.txt"
 
 if [ ! -f "$CONFIG_DIR/hbk" ]; then

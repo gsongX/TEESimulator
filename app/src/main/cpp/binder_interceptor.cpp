@@ -235,15 +235,20 @@ class BinderInterceptor : public BBinder {
     struct RegistrationEntry {
         wp<IBinder> target;
         sp<IBinder> callback_interface;
+        // Transaction codes to intercept. Empty = intercept all (legacy behavior).
         std::vector<uint32_t> filtered_codes;
     };
 
+    // Reader-Writer lock for the registry to allow concurrent reads (lookups)
     mutable std::shared_mutex registry_mutex_;
     std::map<wp<IBinder>, RegistrationEntry> registry_;
 
 public:
     BinderInterceptor() = default;
 
+    // Checks if a specific Binder+code combination should be intercepted.
+    // Returns true if the binder is registered AND the code is in its filter
+    // (or the filter is empty, meaning intercept everything).
     bool shouldIntercept(const wp<BBinder> &target, uint32_t code) const {
         std::shared_lock lock(registry_mutex_);
         auto it = registry_.find(target);
@@ -350,20 +355,13 @@ static sp<BinderStub> g_stub_instance = nullptr;
 
 namespace {
 
-constexpr binder_size_t kMaxInterceptableDataSize = 256 * 1024;
-
+/**
+ * @brief Analyses a binder transaction. If the target is monitored,
+ *        hijacks the transaction by rewriting its destination to our BinderStub.
+ * @param txn_data Pointer to the transaction data within the ioctl buffer.
+ */
 void inspectAndRewriteTransaction(binder_transaction_data *txn_data) {
     if (!txn_data || txn_data->target.ptr == 0)
-        return;
-
-    // Bypass interception for oversized payloads to prevent thread starvation from flood attacks
-    if (txn_data->data_size > kMaxInterceptableDataSize)
-        return;
-
-    // AIDL methods use codes in [FIRST_CALL_TRANSACTION, LAST_CALL_TRANSACTION] (1..0x00ffffff).
-    // System transactions (PING, INTERFACE, DUMP, SHELL_COMMAND) use codes above that range.
-    // Skip those — intercepting a ping adds measurable latency that timing detectors flag.
-    if (txn_data->code > 0x00ffffffu && txn_data->code != intercept::kBackdoorCode)
         return;
 
     bool hijack = false;
@@ -540,11 +538,14 @@ status_t BinderInterceptor::handleRegister(const Parcel &data) {
     if (data.readStrongBinder(&callback) != OK || !callback)
         return BAD_VALUE;
 
+    // We can only intercept local Binders (BBinder), not remote proxies (BpBinder)
     if (target->localBinder() == nullptr) {
         LOGE("Cannot intercept remote binder proxies.");
         return BAD_TYPE;
     }
 
+    // Read optional transaction code filter. If present: int32 count + count * uint32 codes.
+    // If absent or count <= 0: intercept all transaction codes (legacy behavior).
     std::vector<uint32_t> codes;
     int32_t code_count = 0;
     if (data.dataAvail() >= sizeof(int32_t) && data.readInt32(&code_count) == OK && code_count > 0) {
@@ -612,16 +613,9 @@ bool BinderInterceptor::processInterceptedTransaction(uint64_t tx_id, sp<BBinder
     Parcel pre_req, pre_resp;
     writeTransactionData(pre_req, tx_id, target, code, flags, request);
 
-    status_t pre_status = callback->transact(intercept::kPreTransact, pre_req, &pre_resp);
-    if (pre_status != OK) {
-        // Block when interceptor is dead to prevent privacy leak to third-party apps
-        if (callback->pingBinder() != OK) {
-            LOGE("[TX_ID: %" PRIu64 "] Interceptor DEAD. Blocking to prevent attestation leak.", tx_id);
-            result = DEAD_OBJECT;
-            return true;
-        }
-        LOGW("[TX_ID: %" PRIu64 "] Pre-transaction callback failed (not dead). Forwarding.", tx_id);
-        return false;
+    if (callback->transact(intercept::kPreTransact, pre_req, &pre_resp) != OK) {
+        LOGW("[TX_ID: %" PRIu64 "] Pre-transaction callback failed. Forwarding original call.", tx_id);
+        return false; // Callback failed, proceed as if not intercepted
     }
 
     int32_t action = pre_resp.readInt32();
@@ -674,8 +668,7 @@ bool BinderInterceptor::processInterceptedTransaction(uint64_t tx_id, sp<BBinder
         VALIDATE_STATUS(tx_id, post_req.appendFrom(reply, 0, reply_size));
     }
 
-    status_t post_status = callback->transact(intercept::kPostTransact, post_req, &post_resp);
-    if (post_status == OK) {
+    if (callback->transact(intercept::kPostTransact, post_req, &post_resp) == OK) {
         int32_t post_action = post_resp.readInt32();
         if (post_action == intercept::kActionOverrideReply && reply) {
             result = post_resp.readInt32(); // Read new status

@@ -13,7 +13,6 @@ import org.matrix.TEESimulator.interception.keystore.AbstractKeystoreInterceptor
 import org.matrix.TEESimulator.interception.keystore.Keystore2Interceptor
 import org.matrix.TEESimulator.interception.keystore.KeystoreInterceptor
 import org.matrix.TEESimulator.logging.SystemLogger
-import org.matrix.TEESimulator.pki.NativeCertGen
 import org.matrix.TEESimulator.util.AndroidDeviceUtils
 
 /**
@@ -23,6 +22,8 @@ import org.matrix.TEESimulator.util.AndroidDeviceUtils
 object App {
     // The delay in milliseconds before retrying to initialize the interceptor.
     private const val RETRY_DELAY_MS = 1000L
+    // The sleep duration in milliseconds for the main service loop to keep the process alive.
+    private const val SERVICE_SLEEP_MS = 1000000L
 
     /**
      * The main entry point of the TEESimulator application.
@@ -33,18 +34,13 @@ object App {
     fun main(args: Array<String>) {
         SystemLogger.info("Welcome to TEESimulator!")
 
-        Thread.setDefaultUncaughtExceptionHandler { thread, throwable ->
-            SystemLogger.error("Uncaught exception on ${thread.name}", throwable)
-        }
-
         try {
+            // Initialize the Android framework environment
             prepareEnvironment()
             // Initialize and start the appropriate keystore interceptors.
             initializeInterceptors()
 
-            // Load the package configuration.
             ConfigurationManager.initialize()
-            // Set up the device's boot key and hash, which are crucial for attestation.
             AndroidDeviceUtils.setupBootKeyAndHash()
 
             // Android ships with a stripped-down Bouncy Castle provider under the name "BC".
@@ -52,8 +48,6 @@ object App {
             // (packaged with the app) is used.
             Security.removeProvider(BouncyCastleProvider.PROVIDER_NAME)
             Security.addProvider(BouncyCastleProvider())
-
-            NativeCertGen.initialize("/data/adb/modules/tricky_store/libcertgen.so")
 
             // This starts the message queue processing. It blocks here indefinitely
             // processing messages until Looper.myLooper().quit() is called.

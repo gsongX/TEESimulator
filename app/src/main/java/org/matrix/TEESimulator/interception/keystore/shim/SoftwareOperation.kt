@@ -8,8 +8,8 @@ import android.hardware.security.keymint.KeyParameterValue
 import android.hardware.security.keymint.KeyPurpose
 import android.hardware.security.keymint.PaddingMode
 import android.hardware.security.keymint.Tag
+import android.os.RemoteException
 import android.os.ServiceSpecificException
-import java.util.concurrent.locks.LockSupport
 import android.system.keystore2.IKeystoreOperation
 import android.system.keystore2.KeyParameters
 import java.security.KeyPair
@@ -20,16 +20,48 @@ import org.matrix.TEESimulator.attestation.KeyMintAttestation
 import org.matrix.TEESimulator.logging.KeyMintParameterLogger
 import org.matrix.TEESimulator.logging.SystemLogger
 
+/** Keystore2 error codes for ServiceSpecificException. Negative = KeyMint, positive = Keystore. */
+internal object KeystoreErrorCode {
+    const val INVALID_OPERATION_HANDLE = -28
+    const val VERIFICATION_FAILED = -30
+    const val UNSUPPORTED_PURPOSE = -2
+    const val INCOMPATIBLE_PURPOSE = -3
+    const val SYSTEM_ERROR = 4
+    const val TOO_MUCH_DATA = 21
+    const val KEY_EXPIRED = -25
+    const val KEY_NOT_YET_VALID = -24
+
+    /** KeyMint ErrorCode::CALLER_NONCE_PROHIBITED */
+    const val CALLER_NONCE_PROHIBITED = -55
+
+    /** KeyMint ErrorCode::INVALID_ARGUMENT */
+    const val INVALID_ARGUMENT = -38
+
+    /** KeyMint ErrorCode::INVALID_TAG */
+    const val INVALID_TAG = -40
+
+    /** Keystore2 ResponseCode::PERMISSION_DENIED */
+    const val PERMISSION_DENIED = 6
+
+    /** Keystore2 ResponseCode::KEY_NOT_FOUND */
+    const val KEY_NOT_FOUND = 7
+}
+
+// A sealed interface to represent the different cryptographic operations we can perform.
 private sealed interface CryptoPrimitive {
-    fun updateAad(aadInput: ByteArray?) {
-        throw ServiceSpecificException(KeystoreErrorCodes.invalidTag)
-    }
+    fun updateAad(data: ByteArray?)
+
     fun update(data: ByteArray?): ByteArray?
+
     fun finish(data: ByteArray?, signature: ByteArray?): ByteArray?
+
     fun abort()
+
+    /** Returns parameters from the begin phase (e.g. GCM nonce), or null if none. */
     fun getBeginParameters(): Array<KeyParameter>? = null
 }
 
+// Helper object to map KeyMint constants to JCA algorithm strings.
 private object JcaAlgorithmMapper {
     fun mapSignatureAlgorithm(params: KeyMintAttestation): String {
         val digest =
@@ -39,18 +71,17 @@ private object JcaAlgorithmMapper {
                 Digest.SHA_2_512 -> "SHA512"
                 else -> "NONE"
             }
-        return when (params.algorithm) {
-            Algorithm.EC -> "${digest}withECDSA"
-            Algorithm.RSA -> {
-                val isPss = params.padding.firstOrNull() == PaddingMode.RSA_PSS
-                if (isPss) "${digest}withRSA/PSS" else "${digest}withRSA"
+        val keyAlgo =
+            when (params.algorithm) {
+                Algorithm.EC -> "ECDSA"
+                Algorithm.RSA -> "RSA"
+                else ->
+                    throw ServiceSpecificException(
+                        KeystoreErrorCode.SYSTEM_ERROR,
+                        "Unsupported signature algorithm: ${params.algorithm}",
+                    )
             }
-            else ->
-                throw ServiceSpecificException(
-                    KeystoreErrorCodes.incompatibleAlgorithm,
-                    "Unsupported signature algorithm: ${params.algorithm}",
-                )
-        }
+        return "${digest}with${keyAlgo}"
     }
 
     fun mapCipherAlgorithm(params: KeyMintAttestation): String {
@@ -60,7 +91,7 @@ private object JcaAlgorithmMapper {
                 Algorithm.AES -> "AES"
                 else ->
                     throw ServiceSpecificException(
-                        KeystoreErrorCodes.incompatibleAlgorithm,
+                        KeystoreErrorCode.SYSTEM_ERROR,
                         "Unsupported cipher algorithm: ${params.algorithm}",
                     )
             }
@@ -68,28 +99,31 @@ private object JcaAlgorithmMapper {
             when (params.blockMode.firstOrNull()) {
                 BlockMode.ECB -> "ECB"
                 BlockMode.CBC -> "CBC"
-                BlockMode.CTR -> "CTR"
                 BlockMode.GCM -> "GCM"
-                else -> "ECB"
+                else -> "ECB" // Default for RSA
             }
         val padding =
             when (params.padding.firstOrNull()) {
                 PaddingMode.NONE -> "NoPadding"
                 PaddingMode.PKCS7 -> "PKCS7Padding"
                 PaddingMode.RSA_PKCS1_1_5_ENCRYPT -> "PKCS1Padding"
-                PaddingMode.RSA_PKCS1_1_5_SIGN -> "PKCS1Padding"
                 PaddingMode.RSA_OAEP -> "OAEPPadding"
-                else -> "NoPadding"
+                else -> "NoPadding" // Default for GCM
             }
         return "$keyAlgo/$blockMode/$padding"
     }
 }
 
+// Concrete implementation for Signing.
 private class Signer(keyPair: KeyPair, params: KeyMintAttestation) : CryptoPrimitive {
     private val signature: Signature =
         Signature.getInstance(JcaAlgorithmMapper.mapSignatureAlgorithm(params)).apply {
             initSign(keyPair.private)
         }
+
+    override fun updateAad(data: ByteArray?) {
+        throw ServiceSpecificException(KeystoreErrorCode.INVALID_TAG)
+    }
 
     override fun update(data: ByteArray?): ByteArray? {
         if (data != null) signature.update(data)
@@ -104,11 +138,16 @@ private class Signer(keyPair: KeyPair, params: KeyMintAttestation) : CryptoPrimi
     override fun abort() {}
 }
 
+// Concrete implementation for Verification.
 private class Verifier(keyPair: KeyPair, params: KeyMintAttestation) : CryptoPrimitive {
     private val signature: Signature =
         Signature.getInstance(JcaAlgorithmMapper.mapSignatureAlgorithm(params)).apply {
             initVerify(keyPair.public)
         }
+
+    override fun updateAad(data: ByteArray?) {
+        throw ServiceSpecificException(KeystoreErrorCode.INVALID_TAG)
+    }
 
     override fun update(data: ByteArray?): ByteArray? {
         if (data != null) signature.update(data)
@@ -117,11 +156,16 @@ private class Verifier(keyPair: KeyPair, params: KeyMintAttestation) : CryptoPri
 
     override fun finish(data: ByteArray?, signature: ByteArray?): ByteArray? {
         if (data != null) update(data)
-        if (signature == null) {
-            throw ServiceSpecificException(KeystoreErrorCodes.verificationFailed, "Signature to verify is null")
-        }
+        if (signature == null)
+            throw ServiceSpecificException(
+                KeystoreErrorCode.VERIFICATION_FAILED,
+                "Signature to verify is null",
+            )
         if (!this.signature.verify(signature)) {
-            throw ServiceSpecificException(KeystoreErrorCodes.verificationFailed, "Signature verification failed")
+            throw ServiceSpecificException(
+                KeystoreErrorCode.VERIFICATION_FAILED,
+                "Signature/MAC verification failed",
+            )
         }
         return null
     }
@@ -129,20 +173,19 @@ private class Verifier(keyPair: KeyPair, params: KeyMintAttestation) : CryptoPri
     override fun abort() {}
 }
 
+// Concrete implementation for Encryption/Decryption.
 private class CipherPrimitive(
     cryptoKey: java.security.Key,
     params: KeyMintAttestation,
     private val opMode: Int,
 ) : CryptoPrimitive {
-    private val isAead = params.blockMode.firstOrNull() == BlockMode.GCM
     private val cipher: Cipher =
         Cipher.getInstance(JcaAlgorithmMapper.mapCipherAlgorithm(params)).apply {
             init(opMode, cryptoKey)
         }
 
-    override fun updateAad(aadInput: ByteArray?) {
-        if (!isAead) throw ServiceSpecificException(KeystoreErrorCodes.invalidTag)
-        if (aadInput != null) cipher.updateAAD(aadInput)
+    override fun updateAad(data: ByteArray?) {
+        if (data != null) cipher.updateAAD(data)
     }
 
     override fun update(data: ByteArray?): ByteArray? =
@@ -151,6 +194,9 @@ private class CipherPrimitive(
     override fun finish(data: ByteArray?, signature: ByteArray?): ByteArray? =
         if (data != null) cipher.doFinal(data) else cipher.doFinal()
 
+    override fun abort() {}
+
+    /** Returns the cipher IV as a NONCE parameter for GCM operations. */
     override fun getBeginParameters(): Array<KeyParameter>? {
         val iv = cipher.iv ?: return null
         return arrayOf(
@@ -160,20 +206,23 @@ private class CipherPrimitive(
             }
         )
     }
-
-    override fun abort() {}
 }
 
+// Concrete implementation for ECDH Key Agreement.
 private class KeyAgreementPrimitive(keyPair: KeyPair) : CryptoPrimitive {
     private val agreement: javax.crypto.KeyAgreement =
         javax.crypto.KeyAgreement.getInstance("ECDH").apply { init(keyPair.private) }
+
+    override fun updateAad(data: ByteArray?) {
+        throw ServiceSpecificException(KeystoreErrorCode.INVALID_TAG)
+    }
 
     override fun update(data: ByteArray?): ByteArray? = null
 
     override fun finish(data: ByteArray?, signature: ByteArray?): ByteArray? {
         if (data == null)
             throw ServiceSpecificException(
-                KeystoreErrorCodes.invalidArgument,
+                KeystoreErrorCode.INVALID_ARGUMENT,
                 "Peer public key required for key agreement",
             )
         val peerKey =
@@ -186,25 +235,23 @@ private class KeyAgreementPrimitive(keyPair: KeyPair) : CryptoPrimitive {
     override fun abort() {}
 }
 
+/**
+ * A software-only implementation of a cryptographic operation. This class acts as a controller,
+ * delegating to a specific cryptographic primitive based on the operation's purpose.
+ *
+ * Tracks operation lifecycle: once [finish] or [abort] is called, subsequent calls throw
+ * [ServiceSpecificException] with [KeystoreErrorCode.INVALID_OPERATION_HANDLE].
+ */
 class SoftwareOperation(
     private val txId: Long,
     keyPair: KeyPair?,
     secretKey: javax.crypto.SecretKey?,
     params: KeyMintAttestation,
-    private val latencyFloorMs: Long = 0L,
+    var onFinishCallback: (() -> Unit)? = null,
 ) {
     private val primitive: CryptoPrimitive
-    @Volatile var finalized = false
-        private set
 
-    var onFinishCallback: (() -> Unit)? = null
-
-    val beginParameters: KeyParameters?
-        get() {
-            val params = primitive.getBeginParameters() ?: return null
-            if (params.isEmpty()) return null
-            return KeyParameters().apply { keyParameter = params }
-        }
+    @Volatile private var finalized = false
 
     init {
         val purpose = params.purpose.firstOrNull()
@@ -226,175 +273,121 @@ class SoftwareOperation(
                 KeyPurpose.AGREE_KEY -> KeyAgreementPrimitive(keyPair!!)
                 else ->
                     throw ServiceSpecificException(
-                        KeystoreErrorCodes.unsupportedPurpose,
+                        KeystoreErrorCode.UNSUPPORTED_PURPOSE,
                         "Unsupported operation purpose: $purpose",
                     )
             }
     }
 
+    /** Parameters produced during begin (e.g. GCM nonce), to populate CreateOperationResponse. */
+    val beginParameters: KeyParameters?
+        get() {
+            val params = primitive.getBeginParameters() ?: return null
+            if (params.isEmpty()) return null
+            return KeyParameters().apply { keyParameter = params }
+        }
+
     private fun checkActive() {
-        if (finalized) {
-            SystemLogger.debug("[SoftwareOp TX_ID: $txId] Rejected: operation already finalized (pruned or completed)")
-            throw ServiceSpecificException(KeystoreErrorCodes.invalidOperationHandle)
-        }
+        if (finalized)
+            throw ServiceSpecificException(
+                KeystoreErrorCode.INVALID_OPERATION_HANDLE,
+                "Operation already finalized.",
+            )
     }
 
-    private fun checkInputLength(data: ByteArray?) {
-        if (data != null && data.size > MAX_RECEIVE_DATA) {
-            SystemLogger.info("[SoftwareOp TX_ID: $txId] Input too large: ${data.size} > $MAX_RECEIVE_DATA, throwing TOO_MUCH_DATA(${KeystoreErrorCodes.tooMuchData})")
-            throw ServiceSpecificException(KeystoreErrorCodes.tooMuchData)
-        }
-    }
-
-    fun updateAad(aadInput: ByteArray?) {
-        SystemLogger.debug("[SoftwareOp TX_ID: $txId] updateAad() inputSize=${aadInput?.size ?: 0}")
+    fun updateAad(data: ByteArray?) {
         checkActive()
-        checkInputLength(aadInput)
-        primitive.updateAad(aadInput)
+        try {
+            primitive.updateAad(data)
+        } catch (e: ServiceSpecificException) {
+            finalized = true
+            throw e
+        } catch (e: Exception) {
+            finalized = true
+            SystemLogger.error("[SoftwareOp TX_ID: $txId] Failed to updateAad.", e)
+            throw ServiceSpecificException(KeystoreErrorCode.SYSTEM_ERROR, e.message)
+        }
     }
 
     fun update(data: ByteArray?): ByteArray? {
-        SystemLogger.debug("[SoftwareOp TX_ID: $txId] update() inputSize=${data?.size ?: 0}")
         checkActive()
-        checkInputLength(data)
         try {
             return primitive.update(data)
         } catch (e: ServiceSpecificException) {
+            finalized = true
             throw e
         } catch (e: Exception) {
+            finalized = true
             SystemLogger.error("[SoftwareOp TX_ID: $txId] Failed to update operation.", e)
-            throw mapToServiceSpecificException(e)
+            throw ServiceSpecificException(KeystoreErrorCode.SYSTEM_ERROR, e.message)
         }
     }
 
     fun finish(data: ByteArray?, signature: ByteArray?): ByteArray? {
         checkActive()
-        checkInputLength(data)
         try {
-            val startNs = if (latencyFloorMs > 0) System.nanoTime() else 0L
             val result = primitive.finish(data, signature)
-            if (latencyFloorMs > 0) {
-                val elapsedMs = (System.nanoTime() - startNs) / 1_000_000
-                val delayMs = latencyFloorMs - elapsedMs
-                if (delayMs > 0) LockSupport.parkNanos(delayMs * 1_000_000)
-            }
-            finalized = true
-            onFinishCallback?.invoke()
             SystemLogger.info("[SoftwareOp TX_ID: $txId] Finished operation successfully.")
+            onFinishCallback?.invoke()
             return result
         } catch (e: ServiceSpecificException) {
             throw e
         } catch (e: Exception) {
             SystemLogger.error("[SoftwareOp TX_ID: $txId] Failed to finish operation.", e)
-            throw mapToServiceSpecificException(e)
+            throw ServiceSpecificException(KeystoreErrorCode.SYSTEM_ERROR, e.message)
+        } finally {
+            finalized = true
         }
     }
 
     fun abort() {
+        checkActive()
         finalized = true
         primitive.abort()
         SystemLogger.debug("[SoftwareOp TX_ID: $txId] Operation aborted.")
     }
+}
 
-    private fun mapToServiceSpecificException(e: Exception): ServiceSpecificException = when (e) {
-        is SignatureException -> ServiceSpecificException(KeystoreErrorCodes.verificationFailed, e.message)
-        is javax.crypto.BadPaddingException -> ServiceSpecificException(KeystoreErrorCodes.invalidArgument, e.message)
-        is javax.crypto.IllegalBlockSizeException -> ServiceSpecificException(KeystoreErrorCodes.invalidInputLength, e.message)
-        is java.security.InvalidKeyException -> ServiceSpecificException(KeystoreErrorCodes.incompatibleKey, e.message)
-        else -> ServiceSpecificException(KeystoreErrorCodes.unknownError, e.message)
+/** Binder interface for [SoftwareOperation]. Synchronized and input-length validated. */
+class SoftwareOperationBinder(private val operation: SoftwareOperation) :
+    IKeystoreOperation.Stub() {
+
+    private fun checkInputLength(data: ByteArray?) {
+        if (data != null && data.size > MAX_RECEIVE_DATA)
+            throw ServiceSpecificException(KeystoreErrorCode.TOO_MUCH_DATA)
+    }
+
+    @Throws(RemoteException::class)
+    override fun updateAad(aadInput: ByteArray?) {
+        synchronized(this) {
+            checkInputLength(aadInput)
+            operation.updateAad(aadInput)
+        }
+    }
+
+    @Throws(RemoteException::class)
+    override fun update(input: ByteArray?): ByteArray? {
+        synchronized(this) {
+            checkInputLength(input)
+            return operation.update(input)
+        }
+    }
+
+    @Throws(RemoteException::class)
+    override fun finish(input: ByteArray?, signature: ByteArray?): ByteArray? {
+        synchronized(this) {
+            checkInputLength(input)
+            checkInputLength(signature)
+            return operation.finish(input, signature)
+        }
+    }
+
+    @Throws(RemoteException::class)
+    override fun abort() {
+        synchronized(this) { operation.abort() }
     }
 
     companion object {
         private const val MAX_RECEIVE_DATA = 0x8000
-    }
-}
-
-internal object KeystoreErrorCodes {
-    val tooMuchData: Int by lazy {
-        resolveField("android.system.keystore2.ResponseCode", "TOO_MUCH_DATA", 21)
-    }
-
-    val invalidOperationHandle: Int by lazy {
-        resolveField("android.hardware.security.keymint.ErrorCode", "INVALID_OPERATION_HANDLE", -28)
-    }
-
-    val invalidTag: Int by lazy {
-        resolveField("android.hardware.security.keymint.ErrorCode", "INVALID_TAG", -76)
-    }
-
-    val verificationFailed: Int by lazy {
-        resolveField("android.hardware.security.keymint.ErrorCode", "VERIFICATION_FAILED", -30)
-    }
-
-    val invalidArgument: Int by lazy {
-        resolveField("android.hardware.security.keymint.ErrorCode", "INVALID_ARGUMENT", -38)
-    }
-
-    val invalidInputLength: Int by lazy {
-        resolveField("android.hardware.security.keymint.ErrorCode", "INVALID_INPUT_LENGTH", -21)
-    }
-
-    val incompatibleKey: Int by lazy {
-        resolveField("android.hardware.security.keymint.ErrorCode", "INCOMPATIBLE_KEY", -31)
-    }
-
-    val incompatiblePurpose: Int by lazy {
-        resolveField("android.hardware.security.keymint.ErrorCode", "INCOMPATIBLE_PURPOSE", -13)
-    }
-
-    val unsupportedPurpose: Int by lazy {
-        resolveField("android.hardware.security.keymint.ErrorCode", "UNSUPPORTED_PURPOSE", -14)
-    }
-
-    val incompatibleAlgorithm: Int by lazy {
-        resolveField("android.hardware.security.keymint.ErrorCode", "INCOMPATIBLE_ALGORITHM", -18)
-    }
-
-    val keyNotYetValid: Int by lazy {
-        resolveField("android.hardware.security.keymint.ErrorCode", "KEY_NOT_YET_VALID", -39)
-    }
-
-    val keyExpired: Int by lazy {
-        resolveField("android.hardware.security.keymint.ErrorCode", "KEY_EXPIRED", -40)
-    }
-
-    val callerNonceProhibited: Int by lazy {
-        resolveField("android.hardware.security.keymint.ErrorCode", "CALLER_NONCE_PROHIBITED", -55)
-    }
-
-    val unknownError: Int by lazy {
-        resolveField("android.hardware.security.keymint.ErrorCode", "UNKNOWN_ERROR", -1000)
-    }
-
-    fun resolveField(className: String, fieldName: String, fallback: Int): Int =
-        runCatching {
-            Class.forName(className).getField(fieldName).getInt(null)
-        }.getOrElse {
-            SystemLogger.debug("Resolved $className.$fieldName via fallback: $fallback")
-            fallback
-        }
-}
-
-class SoftwareOperationBinder(private val operation: SoftwareOperation) :
-    IKeystoreOperation.Stub() {
-
-    @Synchronized
-    override fun updateAad(aadInput: ByteArray?) {
-        operation.updateAad(aadInput)
-    }
-
-    @Synchronized
-    override fun update(input: ByteArray?): ByteArray? {
-        return operation.update(input)
-    }
-
-    @Synchronized
-    override fun finish(input: ByteArray?, signature: ByteArray?): ByteArray? {
-        return operation.finish(input, signature)
-    }
-
-    @Synchronized
-    override fun abort() {
-        operation.abort()
     }
 }

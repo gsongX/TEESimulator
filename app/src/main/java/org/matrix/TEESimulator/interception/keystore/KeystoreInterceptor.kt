@@ -399,17 +399,18 @@ private data class LegacyKeygenParameters(
 
     /**
      * Converts the legacy parameters into the modern [KeyMintAttestation] data structure, which is
-     * required by the refactored [AttestationBuilder] and [CertificateGenerator].
+     * required by [AttestationBuilder] and [CertificateGenerator].
      */
     fun toKeyMintAttestation(): KeyMintAttestation {
         // This conversion acts as a bridge, allowing our new generic components
         // to be used by the legacy interceptor.
         return KeyMintAttestation(
-            keySize = this.keySize,
             algorithm = this.algorithm,
-            ecCurve = 0,
+            ecCurve = 0, // Not explicitly available in legacy args, but not critical
             ecCurveName = this.ecCurveName ?: "",
-            origin = null,
+            keySize = this.keySize,
+            origin = null, // Not needed to build attestaion
+            noAuthRequired = null,
             blockMode = listOf<Int>(),
             padding = listOf<Int>(),
             purpose = this.purpose,
@@ -443,7 +444,6 @@ private data class LegacyKeygenParameters(
             allowWhileOnBody = null,
             trustedUserPresenceRequired = null,
             trustedConfirmationRequired = null,
-            noAuthRequired = null,
             maxUsesPerBoot = null,
             maxBootLevel = null,
             minMacLength = null,

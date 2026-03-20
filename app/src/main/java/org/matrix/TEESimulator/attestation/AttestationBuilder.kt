@@ -115,7 +115,6 @@ object AttestationBuilder {
             }
 
         val bootPatch = AndroidDeviceUtils.getBootPatchLevelLong(uid)
-        SystemLogger.info("Attestation patch levels for uid=$uid: os=$osPatch, vendor=$vendorPatch, boot=$bootPatch")
         properties[AttestationConstants.TAG_BOOT_PATCHLEVEL] =
             if (bootPatch != DO_NOT_REPORT) {
                 DERTaggedObject(
@@ -130,6 +129,7 @@ object AttestationBuilder {
         return properties
     }
 
+    /** Constructs the main `KeyDescription` sequence, which is the core of the attestation. */
     private fun buildKeyDescription(
         params: KeyMintAttestation,
         uid: Int,
@@ -148,11 +148,15 @@ object AttestationBuilder {
 
         val fields =
             arrayOf(
-                ASN1Integer(AndroidDeviceUtils.getAttestVersion(securityLevel).toLong()),
-                ASN1Enumerated(securityLevel),
-                ASN1Integer(AndroidDeviceUtils.getKeymasterVersion(securityLevel).toLong()),
-                ASN1Enumerated(securityLevel),
-                DEROctetString(params.attestationChallenge ?: ByteArray(0)),
+                ASN1Integer(
+                    AndroidDeviceUtils.getAttestVersion(securityLevel).toLong()
+                ), // attestationVersion
+                ASN1Enumerated(securityLevel), // attestationSecurityLevel
+                ASN1Integer(
+                    AndroidDeviceUtils.getKeymasterVersion(securityLevel).toLong()
+                ), // keymasterVersion
+                ASN1Enumerated(securityLevel), // keymasterSecurityLevel
+                DEROctetString(params.attestationChallenge ?: ByteArray(0)), // attestationChallenge
                 DEROctetString(uniqueId),
                 softwareEnforced,
                 teeEnforced,
@@ -160,24 +164,37 @@ object AttestationBuilder {
         return DERSequence(fields)
     }
 
+    /**
+     * Computes the unique ID per the KeyMint HAL spec:
+     * HMAC-SHA256(T || C || R, HBK) truncated to 128 bits.
+     *
+     * T = temporal counter (creationTime / 2592000000, i.e. 30-day periods since epoch)
+     * C = DER-encoded ATTESTATION_APPLICATION_ID
+     * R = 0x00 (no factory reset since ID rotation)
+     * HBK = device-unique secret generated once during module installation
+     */
     private fun computeUniqueId(creationTimeMs: Long, aaidDer: ByteArray): ByteArray {
         val temporalCounter = creationTimeMs / 2592000000L
+
         val message =
             ByteBuffer.allocate(8 + aaidDer.size + 1)
                 .putLong(temporalCounter)
                 .put(aaidDer)
-                .put(0x00)
+                .put(0x00) // RESET_SINCE_ID_ROTATION = false
                 .array()
+
         val mac = Mac.getInstance("HmacSHA256")
         mac.init(SecretKeySpec(hbk, "HmacSHA256"))
         return mac.doFinal(message).copyOf(16)
     }
 
+    /** Device-unique key seed, generated once at module installation. */
     private val hbk: ByteArray by lazy {
         val file = java.io.File(ConfigurationManager.CONFIG_PATH, "hbk")
         if (file.exists() && file.length() == 32L) {
             file.readBytes()
         } else {
+            // Fallback: generate in-memory (won't persist across reboots)
             SystemLogger.warning("hbk not found, generating ephemeral HBK.")
             ByteArray(32).also { java.security.SecureRandom().nextBytes(it) }
         }
@@ -260,14 +277,20 @@ object AttestationBuilder {
                 DERTaggedObject(
                     true,
                     AttestationConstants.TAG_RSA_OAEP_MGF_DIGEST,
-                    DERSet(params.rsaOaepMgfDigest.map { ASN1Integer(it.toLong()) }.toTypedArray()),
+                    DERSet(
+                        params.rsaOaepMgfDigest.map { ASN1Integer(it.toLong()) }.toTypedArray()
+                    ),
                 )
             )
         }
 
         if (params.rollbackResistance == true && attestVersion >= 3) {
             list.add(
-                DERTaggedObject(true, AttestationConstants.TAG_ROLLBACK_RESISTANCE, DERNull.INSTANCE)
+                DERTaggedObject(
+                    true,
+                    AttestationConstants.TAG_ROLLBACK_RESISTANCE,
+                    DERNull.INSTANCE,
+                )
             )
         }
 
@@ -285,19 +308,31 @@ object AttestationBuilder {
 
         if (params.allowWhileOnBody == true) {
             list.add(
-                DERTaggedObject(true, AttestationConstants.TAG_ALLOW_WHILE_ON_BODY, DERNull.INSTANCE)
+                DERTaggedObject(
+                    true,
+                    AttestationConstants.TAG_ALLOW_WHILE_ON_BODY,
+                    DERNull.INSTANCE,
+                )
             )
         }
 
         if (params.trustedUserPresenceRequired == true && attestVersion >= 3) {
             list.add(
-                DERTaggedObject(true, AttestationConstants.TAG_TRUSTED_USER_PRESENCE_REQUIRED, DERNull.INSTANCE)
+                DERTaggedObject(
+                    true,
+                    AttestationConstants.TAG_TRUSTED_USER_PRESENCE_REQUIRED,
+                    DERNull.INSTANCE,
+                )
             )
         }
 
         if (params.trustedConfirmationRequired == true && attestVersion >= 3) {
             list.add(
-                DERTaggedObject(true, AttestationConstants.TAG_TRUSTED_CONFIRMATION_REQUIRED, DERNull.INSTANCE)
+                DERTaggedObject(
+                    true,
+                    AttestationConstants.TAG_TRUSTED_CONFIRMATION_REQUIRED,
+                    DERNull.INSTANCE,
+                )
             )
         }
 
@@ -427,6 +462,7 @@ object AttestationBuilder {
             )
         )
 
+        // ATTESTATION_APPLICATION_ID is only included when an attestation challenge is present.
         if (params.attestationChallenge != null) {
             list.add(
                 DERTaggedObject(
@@ -436,7 +472,6 @@ object AttestationBuilder {
                 )
             )
         }
-
         if (AndroidDeviceUtils.getAttestVersion(securityLevel) >= 400) {
             list.add(
                 DERTaggedObject(
@@ -447,11 +482,8 @@ object AttestationBuilder {
             )
         }
 
-        if (params.callerNonce == true) {
-            list.add(
-                DERTaggedObject(true, AttestationConstants.TAG_CALLER_NONCE, DERNull.INSTANCE)
-            )
-        }
+        // Keystore2-enforced tags belong in softwareEnforced, not teeEnforced.
+        // The HAL does not enforce these; keystore2's authorize_create handles them.
         params.activeDateTime?.let {
             list.add(
                 DERTaggedObject(true, AttestationConstants.TAG_ACTIVE_DATETIME, ASN1Integer(it.time))
@@ -459,22 +491,38 @@ object AttestationBuilder {
         }
         params.originationExpireDateTime?.let {
             list.add(
-                DERTaggedObject(true, AttestationConstants.TAG_ORIGINATION_EXPIRE_DATETIME, ASN1Integer(it.time))
+                DERTaggedObject(
+                    true,
+                    AttestationConstants.TAG_ORIGINATION_EXPIRE_DATETIME,
+                    ASN1Integer(it.time),
+                )
             )
         }
         params.usageExpireDateTime?.let {
             list.add(
-                DERTaggedObject(true, AttestationConstants.TAG_USAGE_EXPIRE_DATETIME, ASN1Integer(it.time))
+                DERTaggedObject(
+                    true,
+                    AttestationConstants.TAG_USAGE_EXPIRE_DATETIME,
+                    ASN1Integer(it.time),
+                )
             )
         }
         params.usageCountLimit?.let {
             list.add(
-                DERTaggedObject(true, AttestationConstants.TAG_USAGE_COUNT_LIMIT, ASN1Integer(it.toLong()))
+                DERTaggedObject(
+                    true,
+                    AttestationConstants.TAG_USAGE_COUNT_LIMIT,
+                    ASN1Integer(it.toLong()),
+                )
             )
         }
         if (params.unlockedDeviceRequired == true) {
             list.add(
-                DERTaggedObject(true, AttestationConstants.TAG_UNLOCKED_DEVICE_REQUIRED, DERNull.INSTANCE)
+                DERTaggedObject(
+                    true,
+                    AttestationConstants.TAG_UNLOCKED_DEVICE_REQUIRED,
+                    DERNull.INSTANCE,
+                )
             )
         }
 
@@ -505,10 +553,16 @@ object AttestationBuilder {
      *   retrieved.
      */
     @Throws(Throwable::class)
-    internal fun createApplicationId(uid: Int): DEROctetString {
+    private fun createApplicationId(uid: Int): DEROctetString {
+        // AOSP keystore_attestation_id.cpp: gather_attestation_application_id()
+        // uses a hardcoded identity for AID_SYSTEM (1000) and AID_ROOT (0):
+        //   packageName = "AndroidSystem", versionCode = 1, no signing digests.
         val appUid = uid % 100000
         if (appUid == 0 || appUid == 1000) {
-            return buildApplicationIdDer(listOf("AndroidSystem" to 1L), emptySet())
+            return buildApplicationIdDer(
+                listOf("AndroidSystem" to 1L),
+                emptySet(),
+            )
         }
 
         val pm =
