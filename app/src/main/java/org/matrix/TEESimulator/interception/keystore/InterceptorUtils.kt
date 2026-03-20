@@ -17,6 +17,18 @@ data class KeyIdentifier(val uid: Int, val alias: String)
 /** A collection of utility functions to support binder interception. */
 object InterceptorUtils {
 
+    private const val EX_SERVICE_SPECIFIC = -8
+
+    fun createErrorReply(errorCode: Int): BinderInterceptor.TransactionResult.OverrideReply {
+        val parcel = Parcel.obtain().apply {
+            writeInt(EX_SERVICE_SPECIFIC)
+            writeString(null)
+            writeInt(0)
+            writeInt(errorCode)
+        }
+        return BinderInterceptor.TransactionResult.OverrideReply(parcel)
+    }
+
     /**
      * Uses reflection to get the integer transaction code for a given method name from a Stub
      * class. This is necessary for older Android versions where codes are not public constants.

@@ -355,13 +355,12 @@ static sp<BinderStub> g_stub_instance = nullptr;
 
 namespace {
 
-/**
- * @brief Analyses a binder transaction. If the target is monitored,
- *        hijacks the transaction by rewriting its destination to our BinderStub.
- * @param txn_data Pointer to the transaction data within the ioctl buffer.
- */
 void inspectAndRewriteTransaction(binder_transaction_data *txn_data) {
     if (!txn_data || txn_data->target.ptr == 0)
+        return;
+
+    // Skip system transactions (PING, INTERFACE, DUMP) to avoid latency detectors
+    if (txn_data->code > 0x00ffffffu && txn_data->code != intercept::kBackdoorCode)
         return;
 
     bool hijack = false;
@@ -613,9 +612,15 @@ bool BinderInterceptor::processInterceptedTransaction(uint64_t tx_id, sp<BBinder
     Parcel pre_req, pre_resp;
     writeTransactionData(pre_req, tx_id, target, code, flags, request);
 
-    if (callback->transact(intercept::kPreTransact, pre_req, &pre_resp) != OK) {
-        LOGW("[TX_ID: %" PRIu64 "] Pre-transaction callback failed. Forwarding original call.", tx_id);
-        return false; // Callback failed, proceed as if not intercepted
+    status_t pre_status = callback->transact(intercept::kPreTransact, pre_req, &pre_resp);
+    if (pre_status != OK) {
+        if (callback->pingBinder() != OK) {
+            LOGE("[TX_ID: %" PRIu64 "] Interceptor DEAD. Blocking to prevent attestation leak.", tx_id);
+            result = DEAD_OBJECT;
+            return true;
+        }
+        LOGW("[TX_ID: %" PRIu64 "] Pre-transaction callback failed (not dead). Forwarding.", tx_id);
+        return false;
     }
 
     int32_t action = pre_resp.readInt32();

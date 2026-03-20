@@ -22,6 +22,7 @@ import java.security.spec.PKCS8EncodedKeySpec
 import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.Executors
 import org.matrix.TEESimulator.attestation.AttestationBuilder
+import org.matrix.TEESimulator.attestation.AttestationConstants
 import org.matrix.TEESimulator.attestation.AttestationPatcher
 import org.matrix.TEESimulator.attestation.KeyMintAttestation
 import org.matrix.TEESimulator.config.ConfigurationManager
@@ -70,7 +71,7 @@ class KeyMintSecurityLevelInterceptor(
             GENERATE_KEY_TRANSACTION -> {
                 logTransaction(txId, transactionNames[code]!!, callingUid, callingPid)
 
-                if (!shouldSkip) return handleGenerateKey(callingUid, callingPid, data)
+                if (!shouldSkip) return handleGenerateKey(txId, callingUid, callingPid, data)
             }
             CREATE_OPERATION_TRANSACTION -> {
                 logTransaction(txId, transactionNames[code]!!, callingUid, callingPid)
@@ -268,16 +269,18 @@ class KeyMintSecurityLevelInterceptor(
 
         val opParams = data.createTypedArray(KeyParameter.CREATOR)!!
         val parsedOpParams = KeyMintAttestation(opParams)
-        data.readBoolean() // forced: no-op for sw ops
-
-        val keyParams = generatedKeyInfo.keyParams
+        val forced = data.readBoolean()
 
         val requestedPurpose = parsedOpParams.purpose.firstOrNull()
         if (requestedPurpose == null) {
-            return InterceptorUtils.createServiceSpecificErrorReply(
-                KeystoreErrorCode.INVALID_ARGUMENT
-            )
+            return InterceptorUtils.createServiceSpecificErrorReply(KEYMINT_INVALID_ARGUMENT)
         }
+
+        if (forced) {
+            return InterceptorUtils.createServiceSpecificErrorReply(PERMISSION_DENIED)
+        }
+
+        val keyParams = generatedKeyInfo.keyParams
 
         val algorithm = keyParams.algorithm
         val isAsymmetric = algorithm == Algorithm.EC || algorithm == Algorithm.RSA
@@ -408,7 +411,7 @@ class KeyMintSecurityLevelInterceptor(
      * Handles the `generateKey` transaction. Based on the configuration for the calling UID, it
      * either generates a key in software or lets the call pass through to the hardware.
      */
-    private fun handleGenerateKey(callingUid: Int, callingPid: Int, data: Parcel): TransactionResult {
+    private fun handleGenerateKey(txId: Long, callingUid: Int, callingPid: Int, data: Parcel): TransactionResult {
         return runCatching {
                 data.enforceInterface(IKeystoreSecurityLevel.DESCRIPTOR)
                 val keyDescriptor = data.readTypedObject(KeyDescriptor.CREATOR)!!
@@ -418,21 +421,26 @@ class KeyMintSecurityLevelInterceptor(
                 )
 
                 val params = data.createTypedArray(KeyParameter.CREATOR)!!
+                val parsedParams = KeyMintAttestation(params)
 
-                // Caller-provided CREATION_DATETIME is not allowed.
-                if (params.any { it.tag == Tag.CREATION_DATETIME }) {
-                    return@runCatching InterceptorUtils.createServiceSpecificErrorReply(
-                        INVALID_ARGUMENT
-                    )
+                val challenge = parsedParams.attestationChallenge
+                if (challenge != null && challenge.size > AttestationConstants.CHALLENGE_LENGTH_LIMIT) {
+                    SystemLogger.warning("[TX_ID: $txId] Rejecting oversized attestation challenge: ${challenge.size} bytes (max ${AttestationConstants.CHALLENGE_LENGTH_LIMIT})")
+                    return InterceptorUtils.createErrorReply(KEYMINT_INVALID_INPUT_LENGTH)
                 }
 
-                // Device ID attestation requires READ_PRIVILEGED_PHONE_STATE.
+                if (params.any { it.tag == Tag.CREATION_DATETIME }) {
+                    SystemLogger.warning("[TX_ID: $txId] Rejecting CREATION_DATETIME in generateKey params")
+                    return InterceptorUtils.createErrorReply(INVALID_ARGUMENT)
+                }
+
                 val hasDeviceIdTags =
                     params.any {
                         it.tag == Tag.ATTESTATION_ID_SERIAL ||
                             it.tag == Tag.ATTESTATION_ID_IMEI ||
                             it.tag == Tag.ATTESTATION_ID_MEID ||
-                            it.tag == Tag.DEVICE_UNIQUE_ATTESTATION
+                            it.tag == Tag.DEVICE_UNIQUE_ATTESTATION ||
+                            it.tag == Tag.ATTESTATION_ID_SECOND_IMEI
                     }
                 if (
                     hasDeviceIdTags &&
@@ -441,13 +449,9 @@ class KeyMintSecurityLevelInterceptor(
                             "android.permission.READ_PRIVILEGED_PHONE_STATE",
                         )
                 ) {
-                    return@runCatching InterceptorUtils.createServiceSpecificErrorReply(
-                        CANNOT_ATTEST_IDS
-                    )
+                    return InterceptorUtils.createErrorReply(CANNOT_ATTEST_IDS)
                 }
 
-                // INCLUDE_UNIQUE_ID requires SELinux gen_unique_id OR Android
-                // REQUEST_UNIQUE_ID_ATTESTATION (security_level.rs:478-485).
                 if (params.any { it.tag == Tag.INCLUDE_UNIQUE_ID }) {
                     val hasSELinux =
                         ConfigurationManager.checkSELinuxPermission(
@@ -461,13 +465,9 @@ class KeyMintSecurityLevelInterceptor(
                             "android.permission.REQUEST_UNIQUE_ID_ATTESTATION",
                         )
                     if (!hasSELinux && !hasAndroid) {
-                        return@runCatching InterceptorUtils.createServiceSpecificErrorReply(
-                            PERMISSION_DENIED
-                        )
+                        return InterceptorUtils.createServiceSpecificErrorReply(PERMISSION_DENIED)
                     }
                 }
-
-                val parsedParams = KeyMintAttestation(params)
                 val isAttestKeyRequest = parsedParams.isAttestKey()
 
                 val forceGenerate =
@@ -878,6 +878,8 @@ class KeyMintSecurityLevelInterceptor(
 
         @Volatile var teeFunctional = false
 
+        private const val KEYMINT_INVALID_INPUT_LENGTH = -21
+        private const val KEYMINT_INVALID_ARGUMENT = -38
         private const val INVALID_ARGUMENT = 20
         private const val PERMISSION_DENIED = 6
         private const val SECURE_HW_COMMUNICATION_FAILED = -49
