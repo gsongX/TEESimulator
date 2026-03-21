@@ -6,11 +6,13 @@ import android.os.Build
 import android.os.IBinder
 import android.os.Parcel
 import android.system.keystore2.Domain
+import android.system.keystore2.IKeystoreSecurityLevel
 import android.system.keystore2.IKeystoreService
 import android.system.keystore2.KeyDescriptor
 import android.system.keystore2.KeyEntryResponse
 import java.security.SecureRandom
 import java.security.cert.Certificate
+import java.util.Collections
 import java.util.concurrent.ConcurrentHashMap
 import org.matrix.TEESimulator.attestation.AttestationPatcher
 import org.matrix.TEESimulator.attestation.KeyMintAttestation
@@ -47,6 +49,8 @@ object Keystore2Interceptor : AbstractKeystoreInterceptor() {
         else null
     private val GET_NUMBER_OF_ENTRIES_TRANSACTION =
         InterceptorUtils.getTransactCode(stubBinderClass, "getNumberOfEntries")
+    private val GET_SECURITY_LEVEL_TRANSACTION =
+        InterceptorUtils.getTransactCode(stubBinderClass, "getSecurityLevel")
 
     private val transactionNames: Map<Int, String> by lazy {
         stubBinderClass.declaredFields
@@ -60,6 +64,17 @@ object Keystore2Interceptor : AbstractKeystoreInterceptor() {
     // Keys whose certs were updated via updateSubcomponent; skip re-patching on getKeyEntry.
     private val userUpdatedKeys = ConcurrentHashMap.newKeySet<KeyIdentifier>()
 
+    // Backdoor binder for registering new interceptors at runtime.
+    private var backdoorBinder: IBinder? = null
+
+    // Per-security-level interceptor instances, keyed by SecurityLevel constant.
+    private val securityLevelInterceptors = ConcurrentHashMap<Int, KeyMintSecurityLevelInterceptor>()
+
+    // Identity set of SecurityLevel binders already registered with the native hook,
+    // tracked by System.identityHashCode to avoid re-registering the same BBinder.
+    private val registeredSecurityLevelBinders: MutableSet<Int> =
+        Collections.newSetFromMap(ConcurrentHashMap())
+
     override val serviceName = "android.system.keystore2.IKeystoreService/default"
     override val processName = "keystore2"
     override val injectionCommand = "exec ./inject `pidof keystore2` libTEESimulator.so entry"
@@ -72,6 +87,7 @@ object Keystore2Interceptor : AbstractKeystoreInterceptor() {
                 LIST_ENTRIES_TRANSACTION,
                 LIST_ENTRIES_BATCHED_TRANSACTION,
                 GET_NUMBER_OF_ENTRIES_TRANSACTION,
+                GET_SECURITY_LEVEL_TRANSACTION,
             )
             .toIntArray()
     }
@@ -81,6 +97,7 @@ object Keystore2Interceptor : AbstractKeystoreInterceptor() {
      * security level sub-services (e.g., TEE, StrongBox).
      */
     override fun onInterceptorReady(service: IBinder, backdoor: IBinder) {
+        backdoorBinder = backdoor
         val keystoreInterface = IKeystoreService.Stub.asInterface(service)
         setupSecurityLevelInterceptors(keystoreInterface, backdoor)
     }
@@ -92,11 +109,11 @@ object Keystore2Interceptor : AbstractKeystoreInterceptor() {
                     SystemLogger.info("Found TEE SecurityLevel. Registering interceptor...")
                     val interceptor =
                         KeyMintSecurityLevelInterceptor(tee, SecurityLevel.TRUSTED_ENVIRONMENT)
-                    register(
+                    securityLevelInterceptors[SecurityLevel.TRUSTED_ENVIRONMENT] = interceptor
+                    registerSecurityLevelBinder(
                         backdoor,
                         tee.asBinder(),
                         interceptor,
-                        KeyMintSecurityLevelInterceptor.INTERCEPTED_CODES,
                     )
                     interceptor.loadPersistedKeys()
                 }
@@ -109,16 +126,40 @@ object Keystore2Interceptor : AbstractKeystoreInterceptor() {
                     SystemLogger.info("Found StrongBox SecurityLevel. Registering interceptor...")
                     val interceptor =
                         KeyMintSecurityLevelInterceptor(strongbox, SecurityLevel.STRONGBOX)
-                    register(
+                    securityLevelInterceptors[SecurityLevel.STRONGBOX] = interceptor
+                    registerSecurityLevelBinder(
                         backdoor,
                         strongbox.asBinder(),
                         interceptor,
-                        KeyMintSecurityLevelInterceptor.INTERCEPTED_CODES,
                     )
                     interceptor.loadPersistedKeys()
                 }
             }
             .onFailure { SystemLogger.error("Failed to intercept StrongBox SecurityLevel.", it) }
+    }
+
+    /**
+     * Registers an interceptor for a SecurityLevel binder, tracking the binder identity
+     * to avoid duplicate registrations when keystore2 returns the same BBinder.
+     */
+    private fun registerSecurityLevelBinder(
+        backdoor: IBinder,
+        binder: IBinder,
+        interceptor: KeyMintSecurityLevelInterceptor,
+    ) {
+        val identity = System.identityHashCode(binder)
+        if (registeredSecurityLevelBinders.add(identity)) {
+            register(
+                backdoor,
+                binder,
+                interceptor,
+                KeyMintSecurityLevelInterceptor.INTERCEPTED_CODES,
+            )
+        } else {
+            SystemLogger.debug(
+                "SecurityLevel binder $binder (identity=$identity) already registered, skipping."
+            )
+        }
     }
 
     override fun onPreTransact(
@@ -210,6 +251,13 @@ object Keystore2Interceptor : AbstractKeystoreInterceptor() {
                 KeyMintParameterLogger.logParameter(it.keyParameter)
             }
             return InterceptorUtils.createTypedObjectReply(response)
+        } else if (code == GET_SECURITY_LEVEL_TRANSACTION) {
+            // Pass through to post-hook so we can register interceptors for newly-created
+            // SecurityLevel binders. keystore2 may create a new BBinder per call, so the
+            // initial registration in setupSecurityLevelInterceptors might not cover all
+            // binder instances that clients receive.
+            logTransaction(txId, "getSecurityLevel", callingUid, callingPid)
+            return TransactionResult.Continue
         } else {
             logTransaction(
                 txId,
@@ -237,6 +285,10 @@ object Keystore2Interceptor : AbstractKeystoreInterceptor() {
     ): TransactionResult {
         if (target != keystoreService || reply == null || InterceptorUtils.hasException(reply))
             return TransactionResult.SkipTransaction
+
+        if (code == GET_SECURITY_LEVEL_TRANSACTION) {
+            return handlePostGetSecurityLevel(txId, data, reply)
+        }
 
         if (code == GET_NUMBER_OF_ENTRIES_TRANSACTION) {
             logTransaction(txId, "post-${transactionNames[code]!!}", callingUid, callingPid)
@@ -441,5 +493,68 @@ object Keystore2Interceptor : AbstractKeystoreInterceptor() {
         )
 
         return InterceptorUtils.createSuccessReply(writeResultCode = false)
+    }
+
+    /**
+     * Intercepts the reply from getSecurityLevel to dynamically register our interceptor
+     * for the returned IKeystoreSecurityLevel binder.
+     *
+     * keystore2 may create a new BBinder for each getSecurityLevel call, so the binder
+     * registered during initial setup (in setupSecurityLevelInterceptors) might not be the
+     * same one that client apps receive. By intercepting every getSecurityLevel reply, we
+     * ensure that all SecurityLevel binders are covered.
+     */
+    private fun handlePostGetSecurityLevel(
+        txId: Long,
+        data: Parcel,
+        reply: Parcel,
+    ): TransactionResult {
+        val backdoor = backdoorBinder
+        if (backdoor == null) {
+            SystemLogger.warning("[TX_ID: $txId] post-getSecurityLevel: backdoor not available")
+            return TransactionResult.SkipTransaction
+        }
+
+        return runCatching {
+            // Read the security level argument from the original request.
+            data.enforceInterface(IKeystoreService.DESCRIPTOR)
+            val requestedLevel = data.readInt()
+
+            // hasException already consumed the exception header from the reply.
+            // Next item is the IKeystoreSecurityLevel binder.
+            val secLevelBinder = reply.readStrongBinder()
+            if (secLevelBinder == null) {
+                SystemLogger.verbose(
+                    "[TX_ID: $txId] getSecurityLevel($requestedLevel) returned null binder"
+                )
+                return@runCatching TransactionResult.SkipTransaction
+            }
+
+            // Only intercept TEE and StrongBox security levels.
+            if (requestedLevel != SecurityLevel.TRUSTED_ENVIRONMENT &&
+                requestedLevel != SecurityLevel.STRONGBOX
+            ) {
+                return@runCatching TransactionResult.SkipTransaction
+            }
+
+            // Get or create the interceptor for this security level. The interceptor may not
+            // exist yet if the initial setupSecurityLevelInterceptors call failed for this level.
+            val interceptor = securityLevelInterceptors.getOrPut(requestedLevel) {
+                val secLevelInterface =
+                    IKeystoreSecurityLevel.Stub.asInterface(secLevelBinder)
+                SystemLogger.info(
+                    "[TX_ID: $txId] Late-creating interceptor for security level $requestedLevel"
+                )
+                KeyMintSecurityLevelInterceptor(secLevelInterface, requestedLevel).also {
+                    it.loadPersistedKeys()
+                }
+            }
+
+            registerSecurityLevelBinder(backdoor, secLevelBinder, interceptor)
+            TransactionResult.SkipTransaction
+        }.getOrElse {
+            SystemLogger.error("[TX_ID: $txId] Failed to process post-getSecurityLevel.", it)
+            TransactionResult.SkipTransaction
+        }
     }
 }
