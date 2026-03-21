@@ -1,6 +1,7 @@
 package org.matrix.TEESimulator.interception.keystore.shim
 
 import android.hardware.security.keymint.Algorithm
+import android.hardware.security.keymint.EcCurve
 import android.hardware.security.keymint.KeyOrigin
 import android.hardware.security.keymint.KeyParameter
 import android.hardware.security.keymint.KeyParameterValue
@@ -20,7 +21,10 @@ import java.security.KeyFactory
 import java.security.cert.CertificateFactory
 import java.security.spec.PKCS8EncodedKeySpec
 import java.util.concurrent.ConcurrentHashMap
+import java.util.concurrent.ConcurrentLinkedDeque
 import java.util.concurrent.Executors
+import java.util.concurrent.atomic.AtomicInteger
+import java.util.concurrent.locks.LockSupport
 import org.matrix.TEESimulator.attestation.AttestationBuilder
 import org.matrix.TEESimulator.attestation.AttestationConstants
 import org.matrix.TEESimulator.attestation.AttestationPatcher
@@ -48,6 +52,8 @@ class KeyMintSecurityLevelInterceptor(
 ) : BinderInterceptor() {
 
     // --- Data Structures for State Management ---
+    private val recentOps = ConcurrentHashMap<Int, ConcurrentLinkedDeque<Long>>()
+
     data class GeneratedKeyInfo(
         val keyPair: KeyPair?,
         val secretKey: javax.crypto.SecretKey?,
@@ -233,6 +239,20 @@ class KeyMintSecurityLevelInterceptor(
         return TransactionResult.SkipTransaction
     }
 
+    private fun trackAndEnforceOpLimit(callingUid: Int, securityLevel: Int) {
+        if (securityLevel != SecurityLevel.STRONGBOX) return
+        val timestamps = recentOps.computeIfAbsent(callingUid) { ConcurrentLinkedDeque() }
+        val cutoff = System.nanoTime() - STRONGBOX_OP_WINDOW_NS
+        timestamps.removeIf { it < cutoff }
+        if (timestamps.size >= STRONGBOX_MAX_CONCURRENT_OPS) {
+            throw android.os.ServiceSpecificException(
+                KEYMINT_TOO_MANY_OPERATIONS,
+                "StrongBox op limit reached for uid=$callingUid"
+            )
+        }
+        timestamps.addLast(System.nanoTime())
+    }
+
     /**
      * Handles the `createOperation` transaction. It checks if the operation is for a key that was
      * generated in software. If so, it creates a software-based operation handler. Otherwise, it
@@ -278,6 +298,8 @@ class KeyMintSecurityLevelInterceptor(
         SystemLogger.info(
             "[TX_ID: $txId] Creating SOFTWARE operation for key ${generatedKeyInfo.nspace}."
         )
+
+        trackAndEnforceOpLimit(callingUid, securityLevel)
 
         val opParams = data.createTypedArray(KeyParameter.CREATOR)!!
         val parsedOpParams = KeyMintAttestation(opParams)
@@ -371,12 +393,14 @@ class KeyMintSecurityLevelInterceptor(
                 // override purpose from the operation params.
                 val effectiveParams =
                     keyParams.copy(purpose = parsedOpParams.purpose, digest = parsedOpParams.digest.ifEmpty { keyParams.digest })
+                val opLatency = if (securityLevel == SecurityLevel.STRONGBOX) STRONGBOX_OP_LATENCY_FLOOR_MS else 0L
                 val softwareOperation =
                     SoftwareOperation(
                         txId,
                         generatedKeyInfo.keyPair,
                         generatedKeyInfo.secretKey,
                         effectiveParams,
+                        opLatency,
                     )
 
                 // Decrement usage counter on finish; delete key when exhausted.
@@ -424,6 +448,11 @@ class KeyMintSecurityLevelInterceptor(
      * either generates a key in software or lets the call pass through to the hardware.
      */
     private fun handleGenerateKey(txId: Long, callingUid: Int, callingPid: Int, data: Parcel): TransactionResult {
+        if (data.dataSize() > MAX_ALIAS_LENGTH) {
+            SystemLogger.warning("Skipping oversized transaction: ${data.dataSize()} bytes")
+            return InterceptorUtils.createErrorReply(KEYMINT_INVALID_INPUT_LENGTH)
+        }
+
         return runCatching {
                 data.enforceInterface(IKeystoreSecurityLevel.DESCRIPTOR)
                 val keyDescriptor = data.readTypedObject(KeyDescriptor.CREATOR)
@@ -493,6 +522,11 @@ class KeyMintSecurityLevelInterceptor(
                 val isAuto = ConfigurationManager.isAutoMode(callingUid)
 
                 val isStrongBox = securityLevel == SecurityLevel.STRONGBOX
+
+                if (isStrongBox && !isStrongBoxCapable(parsedParams)) {
+                    SystemLogger.info("[TX_ID: $txId] StrongBox-unsupported params (algo=${parsedParams.algorithm} size=${parsedParams.keySize}), forwarding to HAL")
+                    return TransactionResult.ContinueAndSkipPost
+                }
 
                 when {
                     forceGenerate -> doSoftwareGeneration(
@@ -571,9 +605,15 @@ class KeyMintSecurityLevelInterceptor(
             }
             generatedKeys[keyId] =
                 GeneratedKeyInfo(null, secretKey, keyDescriptor.nspace, response, parsedParams)
-            TeeLatencySimulator.simulateGenerateKeyDelay(
-                parsedParams.algorithm, System.nanoTime() - genStartNanos
-            )
+
+            if (securityLevel == SecurityLevel.STRONGBOX) {
+                val delayMs = STRONGBOX_KEYGEN_LATENCY_FLOOR_MS - (System.nanoTime() - genStartNanos) / 1_000_000
+                if (delayMs > 0) LockSupport.parkNanos(delayMs * 1_000_000)
+            } else {
+                TeeLatencySimulator.simulateGenerateKeyDelay(
+                    parsedParams.algorithm, System.nanoTime() - genStartNanos
+                )
+            }
             return InterceptorUtils.createTypedObjectReply(metadata)
         }
 
@@ -613,9 +653,14 @@ class KeyMintSecurityLevelInterceptor(
             )
         }
 
-        TeeLatencySimulator.simulateGenerateKeyDelay(
-            parsedParams.algorithm, System.nanoTime() - genStartNanos
-        )
+        if (securityLevel == SecurityLevel.STRONGBOX) {
+            val delayMs = STRONGBOX_KEYGEN_LATENCY_FLOOR_MS - (System.nanoTime() - genStartNanos) / 1_000_000
+            if (delayMs > 0) LockSupport.parkNanos(delayMs * 1_000_000)
+        } else {
+            TeeLatencySimulator.simulateGenerateKeyDelay(
+                parsedParams.algorithm, System.nanoTime() - genStartNanos
+            )
+        }
         return InterceptorUtils.createTypedObjectReply(response.metadata)
     }
 
@@ -900,10 +945,23 @@ class KeyMintSecurityLevelInterceptor(
 
         private const val KEYMINT_INVALID_INPUT_LENGTH = -21
         private const val KEYMINT_INVALID_ARGUMENT = -38
+        private const val KEYMINT_TOO_MANY_OPERATIONS = -29
         private const val INVALID_ARGUMENT = 20
         private const val PERMISSION_DENIED = 6
         private const val SECURE_HW_COMMUNICATION_FAILED = -49
         private const val CANNOT_ATTEST_IDS = -66
+
+        private const val STRONGBOX_KEYGEN_LATENCY_FLOOR_MS = 250L
+        private const val STRONGBOX_OP_LATENCY_FLOOR_MS = 80L
+        private const val STRONGBOX_MAX_CONCURRENT_OPS = 4
+        private const val STRONGBOX_OP_WINDOW_NS = 10_000_000_000L
+        private const val MAX_ALIAS_LENGTH = 256 * 1024
+
+        private fun isStrongBoxCapable(params: KeyMintAttestation): Boolean = when (params.algorithm) {
+            Algorithm.RSA -> params.keySize <= 2048
+            Algorithm.EC -> params.ecCurve == null || params.ecCurve == EcCurve.P_256
+            else -> true
+        }
 
         // Transaction codes for IKeystoreSecurityLevel interface.
         private val GENERATE_KEY_TRANSACTION =
