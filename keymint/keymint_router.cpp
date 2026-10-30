@@ -292,6 +292,13 @@ constexpr auto kConfigWait = std::chrono::seconds(8);
 // the app into deleting and regenerating it.
 constexpr int32_t kNotYetAvailable = -85;
 
+// ErrorCode::EARLY_BOOT_ENDED. A real TEE refuses any EARLY_BOOT_ONLY key once early boot has
+// ended — long before a user app can reach us — so refusing here is what hardware does, not a
+// policy of our own. Our TA's import path does not model the tag: left to it, the import succeeds
+// and hands back an attested chain for a key that must not exist at this point.
+constexpr int32_t kEarlyBootEnded = -73;
+constexpr int32_t kTagEarlyBootOnly = 0x70000131; // Tag::EARLY_BOOT_ONLY
+
 // The TA used for operations on an existing blob of ours (begin/upgrade/etc.), at the level the op
 // arrived on. Any profile's TA can decrypt any of our blobs (the KEK is level- and profile-
 // independent), but the level must match so the reference TA finds the key's characteristics at its
@@ -1137,6 +1144,15 @@ class TeesimKeyMintDevice : public BnKeyMintDevice {
         return st;
       }
       return NoRealHal(__func__);
+    }
+    // Refuse an EARLY_BOOT_ONLY import the way hardware does. The TA accepts the tag and returns a
+    // chain, which is a one-call proof that this attestation is simulated rather than real; a real
+    // TEE has long since signalled early boot as ended by the time any app can ask.
+    for (const auto& p : keyParams) {
+      if (p.tag == static_cast<Tag>(kTagEarlyBootOnly)) {
+        LOGI("importKey: refusing EARLY_BOOT_ONLY import (early boot ended)");
+        return Status(kEarlyBootEnded);
+      }
     }
     auto km = ToKmVec(keyParams);
     auto ak = MakeAttestKey(attestationKey);
