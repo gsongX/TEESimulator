@@ -646,6 +646,18 @@ ndk::ScopedAStatus NoRealHal(const char* what) {
   return Status(-100);
 }
 
+// One line per device-level call, naming the app that asked and what the real HAL answered.
+// keystore2 makes these calls on the app's behalf, so the caller uid is what identifies it, and a
+// checker probing a TEE-only surface is otherwise invisible in this log.
+void LogDeviceCall(const char* what, const ndk::ScopedAStatus& st) {
+  const uid_t uid = AIBinder_getCallingUid();
+  if (st.isOk()) {
+    LOGD("%s: uid=%u rc=0", what, uid);
+  } else {
+    LOGW("%s: uid=%u %s", what, uid, StatusDesc(st).c_str());
+  }
+}
+
 // The reply to an operation on one of our keys that arrives with no TA to serve it.
 //
 // WaitForDefaultTa latches `gave_up` after its first timeout, so on a device where the daemon never
@@ -1092,7 +1104,19 @@ class TeesimKeyMintDevice : public BnKeyMintDevice {
     LogContext lc_(RequestCtx());
     if (real_) {
       ForwardGuard g;
-      return real_->getHardwareInfo(info);
+      auto st = real_->getHardwareInfo(info);
+      LogDeviceCall("getHardwareInfo", st);
+      if (st.isOk()) return st;
+      // A HAL that cannot describe itself still leaves this device claiming TEE-backed keys through
+      // the module. Describe the TA that actually serves them rather than failing a call every
+      // other KeyMint makes cheaply; a healthy HAL answers, so this only fills the hole.
+      LOGW("getHardwareInfo: real HAL failed, describing the TA instead");
+      info->versionNumber = 400;
+      info->securityLevel = level_;
+      info->keyMintName = "keymint";
+      info->keyMintAuthorName = "Google";
+      info->timestampTokenRequired = false;
+      return ndk::ScopedAStatus::ok();
     }
     info->versionNumber = 400;
     info->securityLevel = level_;
@@ -1497,14 +1521,19 @@ class TeesimKeyMintDevice : public BnKeyMintDevice {
                                                   std::vector<uint8_t>* out) override {
     LogContext lc_(RequestCtx());
     ForwardGuard g;
-    return real_ ? real_->convertStorageKeyToEphemeral(storageKeyBlob, out) : NoRealHal(__func__);
+    auto st = real_ ? real_->convertStorageKeyToEphemeral(storageKeyBlob, out)
+                    : NoRealHal(__func__);
+    LogDeviceCall("convertStorageKeyToEphemeral", st);
+    return st;
   }
 
   // Everything below is not simulated; forward to the real HAL when present.
   ndk::ScopedAStatus addRngEntropy(const std::vector<uint8_t>& data) override {
     LogContext lc_(RequestCtx());
     ForwardGuard g;
-    return real_ ? real_->addRngEntropy(data) : ndk::ScopedAStatus::ok();
+    auto st = real_ ? real_->addRngEntropy(data) : ndk::ScopedAStatus::ok();
+    LogDeviceCall("addRngEntropy", st);
+    return st;
   }
   // Wrapped-key import is always forwarded to the real HAL, even for a target app: the result is a
   // real, unmarked blob whose later operations forward to real hardware, so it is never re-rooted
@@ -1518,19 +1547,25 @@ class TeesimKeyMintDevice : public BnKeyMintDevice {
                                       KeyCreationResult* out) override {
     LogContext lc_(RequestCtx());
     ForwardGuard g;
-    return real_ ? real_->importWrappedKey(wrappedKeyData, wrappingKeyBlob, maskingKey,
-                                           unwrappingParams, passwordSid, biometricSid, out)
-                 : NoRealHal(__func__);
+    auto st = real_ ? real_->importWrappedKey(wrappedKeyData, wrappingKeyBlob, maskingKey,
+                                              unwrappingParams, passwordSid, biometricSid, out)
+                    : NoRealHal(__func__);
+    LogDeviceCall("importWrappedKey", st);
+    return st;
   }
   ndk::ScopedAStatus deleteAllKeys() override {
     LogContext lc_(RequestCtx());
     ForwardGuard g;
-    return real_ ? real_->deleteAllKeys() : ndk::ScopedAStatus::ok();
+    auto st = real_ ? real_->deleteAllKeys() : ndk::ScopedAStatus::ok();
+    LogDeviceCall("deleteAllKeys", st);
+    return st;
   }
   ndk::ScopedAStatus destroyAttestationIds() override {
     LogContext lc_(RequestCtx());
     ForwardGuard g;
-    return real_ ? real_->destroyAttestationIds() : ndk::ScopedAStatus::ok();
+    auto st = real_ ? real_->destroyAttestationIds() : ndk::ScopedAStatus::ok();
+    LogDeviceCall("destroyAttestationIds", st);
+    return st;
   }
   // deviceLocked notifies the HAL that the screen locked, so AUTH_TIMEOUT keys require fresh auth
   // before the timeout would otherwise expire. Our TA (an Android-14 kmr-ta) models device lock only
@@ -1545,8 +1580,10 @@ class TeesimKeyMintDevice : public BnKeyMintDevice {
     // relay it verbatim; suppress the deprecation warning for the one forwarding call.
 #pragma clang diagnostic push
 #pragma clang diagnostic ignored "-Wdeprecated-declarations"
-    return real_ ? real_->deviceLocked(passwordOnly, tst) : ndk::ScopedAStatus::ok();
+    auto st = real_ ? real_->deviceLocked(passwordOnly, tst) : ndk::ScopedAStatus::ok();
 #pragma clang diagnostic pop
+    LogDeviceCall("deviceLocked", st);
+    return st;
   }
   ndk::ScopedAStatus earlyBootEnded() override {
     LogContext lc_(RequestCtx());
@@ -1557,23 +1594,31 @@ class TeesimKeyMintDevice : public BnKeyMintDevice {
       if (rc != 0) LOGW("earlyBootEnded: TA rejected rc=%d(%s)", rc, teesim_km_err_name(rc));
     }
     ForwardGuard g;
-    return real_ ? real_->earlyBootEnded() : ndk::ScopedAStatus::ok();
+    auto st = real_ ? real_->earlyBootEnded() : ndk::ScopedAStatus::ok();
+    LogDeviceCall("earlyBootEnded", st);
+    return st;
   }
   ndk::ScopedAStatus getRootOfTrustChallenge(std::array<uint8_t, 16>* out) override {
     LogContext lc_(RequestCtx());
     ForwardGuard g;
-    return real_ ? real_->getRootOfTrustChallenge(out) : NoRealHal(__func__);
+    auto st = real_ ? real_->getRootOfTrustChallenge(out) : NoRealHal(__func__);
+    LogDeviceCall("getRootOfTrustChallenge", st);
+    return st;
   }
   ndk::ScopedAStatus getRootOfTrust(const std::array<uint8_t, 16>& challenge,
                                     std::vector<uint8_t>* out) override {
     LogContext lc_(RequestCtx());
     ForwardGuard g;
-    return real_ ? real_->getRootOfTrust(challenge, out) : NoRealHal(__func__);
+    auto st = real_ ? real_->getRootOfTrust(challenge, out) : NoRealHal(__func__);
+    LogDeviceCall("getRootOfTrust", st);
+    return st;
   }
   ndk::ScopedAStatus sendRootOfTrust(const std::vector<uint8_t>& rootOfTrust) override {
     LogContext lc_(RequestCtx());
     ForwardGuard g;
-    return real_ ? real_->sendRootOfTrust(rootOfTrust) : ndk::ScopedAStatus::ok();
+    auto st = real_ ? real_->sendRootOfTrust(rootOfTrust) : ndk::ScopedAStatus::ok();
+    LogDeviceCall("sendRootOfTrust", st);
+    return st;
   }
   // Record the additional attestation info (e.g. MODULE_HASH on Android 16) on our TAs as well, so a
   // key we attest carries the same value keystore2 pushes to the real HAL and still matches a genuine
