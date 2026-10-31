@@ -23,7 +23,7 @@ object ConfigStore {
     data class ProfileConfig(
         val id: String,
         val keybox: String, // relative to Const.DATA_DIR
-        val mode: String, // "patch" | "generation"
+        val mode: String, // "patch" | "generation" | "auto"
         val patchSystem: String,
         val patchVendor: String,
         val patchBoot: String,
@@ -89,12 +89,14 @@ object ConfigStore {
             if (!keyboxFile.isFile)
                 throw ConfigException("profile '$id' keybox not found: ${keyboxFile.absolutePath}")
 
-            // Operation mode: patch (re-sign the real hardware attestation) or generation (mint the
-            // whole key). Defaults to patch; a level whose hardware is unavailable still falls back
-            // to generation at resolve time.
+            // Operation mode: patch (re-sign the real hardware attestation), generation (mint the
+            // whole key), or auto (choose per device from the harvest). Defaults to patch; a level
+            // whose hardware is unavailable still falls back to generation at resolve time.
             val mode = p.optString("mode", "patch").trim().lowercase()
-            if (mode != "patch" && mode != "generation")
-                throw ConfigException("profile '$id' has invalid mode '$mode' (patch | generation)")
+            if (mode != "patch" && mode != "generation" && mode != "auto")
+                throw ConfigException(
+                    "profile '$id' has invalid mode '$mode' (patch | generation | auto)"
+                )
 
             val patch = p.optJSONObject("patchLevel") ?: JSONObject()
             val apps =
