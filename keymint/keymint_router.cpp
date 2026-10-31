@@ -15,16 +15,20 @@
 
 #include <atomic>
 #include <chrono>
-#include <cstdarg>
+#include <cmath>
 #include <condition_variable>
-#include <ctime>
+#include <cstdarg>
+#include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <ctime>
 #include <map>
 #include <memory>
 #include <mutex>
+#include <random>
 #include <set>
 #include <string>
+#include <thread>
 #include <vector>
 
 #include "control.h"
@@ -490,6 +494,133 @@ ndk::ScopedAStatus Status(int32_t code) {
                    : ndk::ScopedAStatus::fromServiceSpecificError(code);
 }
 
+// --- TEE latency emulation ---------------------------------------------------
+//
+// The TA is a userspace implementation: it finishes a key generation in microseconds where real
+// hardware takes milliseconds, and a caller can see that. A one-millisecond attested key creation is
+// not something a TEE can produce, so the simulator has to spend the time the hardware would, or it
+// stays trivially distinguishable from the thing it stands in for.
+//
+// The shape matters more than the constant. Real TEE latency is log-normal around a per-operation
+// median (a key generation is dominated by a prime search or a certificate chain, not by a
+// predictable instruction count), has a long tail from thermal and scheduling effects, and scales
+// with the CPU the TEE runs on. Sleeping a fixed number of milliseconds would trade one fingerprint
+// ("too fast") for another ("too regular"), which is why all three are modelled here.
+//
+// Tuning lives in /data/adb/teesim/latency.conf, read once per process; without the file the
+// defaults below apply. `enabled=0` turns the emulation off entirely.
+namespace tee_latency {
+
+enum class Kind {
+  kKeyGenEc,    // EC key plus its certificate chain
+  kKeyGenRsa,   // RSA key: the prime search dominates
+  kImport,      // imported key plus chain
+  kBegin,       // operation setup
+  kUpdate,      // per-chunk update
+  kFinishSign,  // the signature itself
+  kFinishOther, // finish without a signature
+};
+
+// Median microseconds at the reference CPU speed, from TEE measurements rather than from the TA.
+constexpr double MedianUs(Kind k) {
+  switch (k) {
+    case Kind::kKeyGenEc:
+      return 18000;
+    case Kind::kKeyGenRsa:
+      return 150000;
+    case Kind::kImport:
+      return 20000;
+    case Kind::kBegin:
+      return 1500;
+    case Kind::kUpdate:
+      return 500;
+    case Kind::kFinishSign:
+      return 4000;
+    case Kind::kFinishOther:
+      return 1200;
+  }
+  return 1000;
+}
+
+struct Settings {
+  bool enabled = true;
+  double scale = 0.0;      // 0 = calibrate from this device's CPU on first use
+  double sigma = 0.30;     // log-normal spread around the median
+  double tail_prob = 0.04; // fraction of calls that take the slow path
+  double tail_mult = 2.5;  // how much slower that path is
+};
+
+void LoadConfig(Settings* s) {
+  FILE* f = fopen("/data/adb/teesim/latency.conf", "r");
+  if (!f) return;
+  char line[256];
+  while (fgets(line, sizeof(line), f)) {
+    char* eq = strchr(line, '=');
+    if (!eq) continue;
+    *eq = '\0';
+    const double v = atof(eq + 1);
+    if (!strcmp(line, "enabled")) s->enabled = v != 0;
+    else if (!strcmp(line, "scale")) s->scale = v;
+    else if (!strcmp(line, "sigma")) s->sigma = v;
+    else if (!strcmp(line, "tail")) s->tail_prob = v;
+    else if (!strcmp(line, "tail_mult")) s->tail_mult = v;
+  }
+  fclose(f);
+}
+
+Settings& Mutable() {
+  static Settings s;
+  static std::once_flag once;
+  std::call_once(once, [] { LoadConfig(&s); });
+  return s;
+}
+
+// Nanoseconds per latency-bound multiply-add: ~0.35 on a current big core, over 1.0 on an old little
+// one. Divided by a reference and clamped, so a fast phone and a slow tablet do not answer in
+// lockstep, while a mis-calibrated device cannot stall the whole system.
+double Calibrate() {
+  volatile double x = 1.0;
+  constexpr int kIters = 300000;
+  const auto t0 = std::chrono::steady_clock::now();
+  for (int i = 0; i < kIters; ++i) x = x * 1.0000001 + 1e-9;
+  const auto t1 = std::chrono::steady_clock::now();
+  const double ns_per = std::chrono::duration<double, std::nano>(t1 - t0).count() / kIters;
+  double s = ns_per / 0.40;
+  if (s < 0.6) s = 0.6;
+  if (s > 2.2) s = 2.2;
+  return s;
+}
+
+double Scale() {
+  static const double calibrated = Calibrate();
+  const double configured = Mutable().scale;
+  return configured > 0.0 ? configured : calibrated;
+}
+
+bool IsRsaAlgorithm(const std::vector<KeyParameter>& params) {
+  for (const auto& p : params) {
+    if (p.tag == Tag::ALGORITHM && p.value.getTag() == KeyParameterValue::algorithm) {
+      return p.value.get<KeyParameterValue::algorithm>() == Algorithm::RSA;
+    }
+  }
+  return false;
+}
+
+void Sleep(Kind k) {
+  Settings& s = Mutable();
+  if (!s.enabled) return;
+  static thread_local std::mt19937 rng{std::random_device{}()};
+  std::lognormal_distribution<double> spread(0.0, s.sigma);
+  double factor = spread(rng);
+  if (std::uniform_real_distribution<double>(0.0, 1.0)(rng) < s.tail_prob) factor *= s.tail_mult;
+  double us = MedianUs(k) * Scale() * factor;
+  if (us < 50.0) us = 50.0;
+  if (us > 2000000.0) us = 2000000.0;  // never more than 2 s, whatever the config says
+  std::this_thread::sleep_for(std::chrono::duration<double, std::micro>(us));
+}
+
+}  // namespace tee_latency
+
 // A forwarded call's outcome, in the form the log wants it: the KeyMint status by number and by
 // name. A transaction that died before reaching the HAL carries no service-specific error at all — its
 // getServiceSpecificError() is 0, which reads as success — so that case is reported as the binder
@@ -773,6 +904,7 @@ class TeesimKeyMintOperation : public BnKeyMintOperation {
     if (rc != 0) return Status(rc);
     out->assign(buf, buf + len);
     teesim_km_free_buf(buf, len);
+    tee_latency::Sleep(tee_latency::Kind::kUpdate);
     return ndk::ScopedAStatus::ok();
   }
 
@@ -805,6 +937,7 @@ class TeesimKeyMintOperation : public BnKeyMintOperation {
     if (rc != 0) return Status(rc);
     out->assign(buf, buf + len);
     teesim_km_free_buf(buf, len);
+    tee_latency::Sleep(tee_latency::Kind::kFinishSign);
     return ndk::ScopedAStatus::ok();
   }
 
@@ -859,6 +992,19 @@ class ForwardedKeyMintOperation : public BnKeyMintOperation {
         op_id_(std::move(op_id)),
         ctx_(std::move(ctx)) {}
 
+  ~ForwardedKeyMintOperation() override {
+    if (finished_) return;
+    LogContext lc_(ctx_);
+    // keystore2 dropped the operation without a finish or an abort: a pruned slot, or an app that
+    // went away mid-operation. Release the real HAL's slot now instead of leaving it to binder GC —
+    // a TEE that is dead or busy has a small operation table, and the caller's next begin is what
+    // pays for the delay (TOO_MANY_OPERATIONS).
+    ForwardGuard g;
+    auto st = real_->abort();
+    LOGD("op[%s/%s] real dropped without finish: abort rc=%d", blob_tag_.c_str(), op_id_.c_str(),
+         st.isOk() ? 0 : st.getServiceSpecificError());
+  }
+
   ndk::ScopedAStatus updateAad(const std::vector<uint8_t>& input,
                                const std::optional<HardwareAuthToken>& authToken,
                                const std::optional<secureclock::TimeStampToken>& tst) override {
@@ -896,6 +1042,7 @@ class ForwardedKeyMintOperation : public BnKeyMintOperation {
     // the call untouched and the real hardware is what rejected it.
     LogOp("real finish", st, "in=%zu sig=%zu in_total=%zu out=%zu from=real-hal", in_len,
           signature ? signature->size() : 0, in_total_ + in_len, out ? out->size() : 0);
+    finished_ = true;
     return st;
   }
 
@@ -904,6 +1051,7 @@ class ForwardedKeyMintOperation : public BnKeyMintOperation {
     ForwardGuard g;
     auto st = real_->abort();
     LogOp("real abort", st, "in_total=%zu", in_total_);
+    finished_ = true;
     return st;
   }
 
@@ -930,6 +1078,7 @@ class ForwardedKeyMintOperation : public BnKeyMintOperation {
   std::string op_id_;
   std::string ctx_;
   size_t in_total_ = 0;
+  bool finished_ = false;
 };
 
 // --- IKeyMintDevice ----------------------------------------------------------
@@ -1169,6 +1318,7 @@ class TeesimKeyMintDevice : public BnKeyMintDevice {
     teesim_km_free_result(res);
     LOGI("importKey: emitted %zu-cert chain (imported into the TA) key=%s blob_len=%zu",
          out->certificateChain.size(), BlobTag(out->keyBlob).c_str(), out->keyBlob.size());
+    tee_latency::Sleep(tee_latency::Kind::kImport);
     return ndk::ScopedAStatus::ok();
   }
 
@@ -1187,6 +1337,16 @@ class TeesimKeyMintDevice : public BnKeyMintDevice {
       if (real_) {
         ForwardGuard g;
         auto st = real_->begin(purpose, keyBlob, params, authToken, out);
+        // A TEE that is dead or busy answers TOO_MANY_OPERATIONS while an earlier operation is
+        // still being torn down; the window is milliseconds and keystore2 does not retry it. Give
+        // it a short, bounded backoff instead of handing the caller a state it cannot recover from.
+        for (int attempt = 0; attempt < 3 && !st.isOk() &&
+                              st.getExceptionCode() == EX_SERVICE_SPECIFIC &&
+                              st.getServiceSpecificError() == -31;
+             ++attempt) {
+          std::this_thread::sleep_for(std::chrono::milliseconds(4 * (attempt + 1)));
+          st = real_->begin(purpose, keyBlob, params, authToken, out);
+        }
         if (!st.isOk()) {
           LOGW("begin: FAILED in the real HAL: %s; %s", StatusDesc(st).c_str(), what.c_str());
           return st;
@@ -1229,6 +1389,7 @@ class TeesimKeyMintDevice : public BnKeyMintDevice {
     out->operation =
         ndk::SharedRefBase::make<TeesimKeyMintOperation>(ta, op_handle, blob_tag,
                                                         teesim_log_context());
+    tee_latency::Sleep(tee_latency::Kind::kBegin);
     return ndk::ScopedAStatus::ok();
   }
 
@@ -1560,6 +1721,8 @@ class TeesimKeyMintDevice : public BnKeyMintDevice {
     LOGI("Simulate: emitted %zu-cert chain (whole key minted in the TA) key=%s blob_len=%zu "
          "ta=%llums",
          out->certificateChain.size(), BlobTag(out->keyBlob).c_str(), out->keyBlob.size(), ta_ms);
+    tee_latency::Sleep(tee_latency::IsRsaAlgorithm(keyParams) ? tee_latency::Kind::kKeyGenRsa
+                                                             : tee_latency::Kind::kKeyGenEc);
     return ndk::ScopedAStatus::ok();
   }
 
