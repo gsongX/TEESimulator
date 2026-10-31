@@ -124,9 +124,28 @@ object Resolver {
         o.put("keyboxB64", b64.encodeToString(keyboxBytes))
 
         // Operation mode: "patch" re-signs the real hardware attestation, "generation" mints the
-        // whole key in our TA. The router still forces generation for a level whose hardware is
-        // unavailable.
-        o.put("mode", p.mode)
+        // whole key in our TA, and "auto" picks between them from the harvest. Auto is resolved
+        // here and never reaches the router: a device whose TEE cannot attest (a vendor that
+        // disables attestation when the bootloader is unlocked, or a software-only keymaster) has
+        // no patch to make, and attempting one first fails on every single request — the router's
+        // fallback then generates anyway, but only after a rejected round trip to the dead HAL,
+        // which is observable from the caller. Resolving once per push keeps that attempt out of
+        // the request path entirely.
+        val effectiveMode =
+            if (p.mode == "auto") {
+                if (Harvester.noWorkingHardware(harvest)) "generation" else "patch"
+            } else {
+                p.mode
+            }
+        if (p.mode == "auto") {
+            SystemLogger.info(
+                "Resolver[${p.id}]: mode auto -> $effectiveMode " +
+                    "(hardware attestation " +
+                    (if (effectiveMode == "patch") "available" else "unavailable") +
+                    ")"
+            )
+        }
+        o.put("mode", effectiveMode)
 
         // Security level is not a profile choice: it is the device's real harvested level, except
         // that a device with no working hardware attestation (software-only / TEE-broken) presents
