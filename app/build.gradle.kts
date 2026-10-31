@@ -53,7 +53,16 @@ android {
         externalNativeBuild {
             cmake {
                 // The interceptors are 64-bit only (keystore2 is 64-bit everywhere).
-                abiFilters += listOf("arm64-v8a", "x86_64")
+                // `-Pabis=arm64-v8a` trims the set for a build that only ships to real hardware;
+                // on a two-core CI runner that halves the native compile, which is the bulk of it.
+                val abis =
+                    (providers.gradleProperty("abis").orNull)
+                        ?.split(',')
+                        ?.map { it.trim() }
+                        ?.filter { it.isNotEmpty() }
+                        ?.takeIf { it.isNotEmpty() }
+                        ?: listOf("arm64-v8a", "x86_64")
+                abiFilters += abis
                 // Match package.sh: build the injector, the UDS client, the daemon's log reader,
                 // and both interceptors; the static BoringSSL `crypto` target builds transitively
                 // for keystore.

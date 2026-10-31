@@ -67,39 +67,32 @@ jobs:
           rustup component add clippy
           ./rust/build.sh clippy
 
+      # arm64 only, Release only. The payload ships to real devices, and a second ABI plus a debug
+      # variant doubles the native compile for no benefit — which is the bulk of a build on the
+      # two-core runner a private repository gets. Add `-Pabis=arm64-v8a,x86_64` or `zipDebug`
+      # locally when the other set is actually needed.
       - name: Build the module
         env:
           ANDROID_NDK_HOME: ${{ env.ANDROID_HOME }}/ndk/${{ env.NDK_VERSION }}
-        run: ./gradlew zipRelease zipDebug
+        run: ./gradlew zipRelease -Pabis=arm64-v8a
 
       # upload-artifact re-zips whatever it is given on download, so handing it the built module zip
-      # yields a zip-of-a-zip that has to be unpacked twice before flashing. Unpack each variant and
-      # upload its contents, so the downloaded artifact is a single, directly-flashable module. Release
-      # and Debug go up as separate artifacts, each named after its build.
+      # yields a zip-of-a-zip that has to be unpacked twice before flashing. Unpack it and upload the
+      # contents, so the downloaded artifact is a single, directly-flashable module.
       - name: Stage the module artifacts
         id: artifacts
         run: |
           set -euo pipefail
           rel=$(ls out/TEESimulator-*-Release.zip)
-          dbg=$(ls out/TEESimulator-*-Debug.zip)
-          mkdir -p artifact-release artifact-debug
+          mkdir -p artifact-release
           unzip -q "$rel" -d artifact-release
-          unzip -q "$dbg" -d artifact-debug
           echo "release=$(basename "$rel" .zip)" >> "$GITHUB_OUTPUT"
-          echo "debug=$(basename "$dbg" .zip)" >> "$GITHUB_OUTPUT"
 
       - name: Upload the release module
         uses: actions/upload-artifact@v7
         with:
           name: ${{ steps.artifacts.outputs.release }}
           path: artifact-release/*
-          if-no-files-found: error
-
-      - name: Upload the debug module
-        uses: actions/upload-artifact@v7
-        with:
-          name: ${{ steps.artifacts.outputs.debug }}
-          path: artifact-debug/*
           if-no-files-found: error
 
       # --- stable release (pushed v* tag) --------------------------------------------------------
@@ -119,14 +112,13 @@ jobs:
           TAG: ${{ github.ref_name }}
         run: |
           set -euo pipefail
-          # Drop the -<hash> segment sitting before -Release/-Debug so the release assets read
+          # Drop the -<hash> segment sitting before -Release so the release asset reads
           # TEESimulator-<ver>-<count>-Release.zip, matching module/update.json's zipUrl.
-          for z in out/TEESimulator-*-Release.zip out/TEESimulator-*-Debug.zip; do
+          for z in out/TEESimulator-*-Release.zip; do
             clean=$(echo "$z" | sed -E 's/-[0-9a-f]{7,}-(Release|Debug)\.zip$/-\1.zip/')
             [ "$z" = "$clean" ] || mv "$z" "$clean"
           done
           rel=$(ls out/TEESimulator-*-Release.zip)
-          dbg=$(ls out/TEESimulator-*-Debug.zip)
           # `%s` argument, never the format string, so a `%` anywhere in the changelog stays literal.
           notes=$(printf '# TEESimulator %s\n\n%s\n' "${TAG}" "$(cat module/changelog.md)")
           # Recreated rather than edited so a re-run replaces the assets instead of appending a second
@@ -136,7 +128,7 @@ jobs:
             --latest \
             --title "TEESimulator ${TAG}" \
             --notes "$notes" \
-            "$rel" "$dbg"
+            "$rel"
 
       # --- canary distribution (dev push) --------------------------------------------------------
       #
@@ -166,11 +158,7 @@ jobs:
 
           A canary — the current state of \`dev\`, tested by CI and nothing else, published as a
           prerelease so it can be downloaded (and flashed from the WebUI) without a GitHub account.
-
-          | Build | Use it when |
-          | :-- | :-- |
-          | \`…-Debug.zip\` | Chasing a bug — far more logging. |
-          | \`…-Release.zip\` | You just want the newest code. |
+          Built for **arm64-v8a** only, Release variant only.
 
           Only the five most recent canaries are kept.
           EOF
@@ -182,8 +170,7 @@ jobs:
             --target "${{ github.sha }}" \
             --title "TEESimulator canary ${code}" \
             --notes "$notes" \
-            out/TEESimulator-*-Release.zip \
-            out/TEESimulator-*-Debug.zip
+            out/TEESimulator-*-Release.zip
 
       # Five is enough to bisect a regression; sorted by version code (commit count, monotonic), not
       # date, which reruns and reverts can disorder.
