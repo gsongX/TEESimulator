@@ -63,9 +63,24 @@ constexpr char kSep = '\x01';
 constexpr size_t kRingCap = 4000;
 
 // On-disk rotation: teesim.log plus up to kMaxParts rolled parts, each capped at kMaxLogSize.
-constexpr size_t kMaxLogSize = 2 * 1024 * 1024;  // 2 MB per part
-constexpr int kMaxParts = 4;                     // teesim.log + .1..4  => ~10 MB of history
-constexpr long kLogBufferSize = 256 * 1024;      // ask logd for a larger buffer to cut dropped reads
+//
+// The budget is deliberately small. These files live in the module's own directory, which anything
+// walking /data/adb pays to read: at 2 MB per part and five parts, a scanner with a stage timeout
+// started failing once the directory passed ~2.5 MB, and passed again as soon as the history was
+// cleared. Verbose lines are also no longer written here at all (see Persist), so what fills these
+// parts is the level a later reader actually needs.
+constexpr size_t kMaxLogSize = 256 * 1024;  // 256 KB per part
+constexpr int kMaxParts = 2;                // teesim.log + .1..2  => ~768 KB of history
+constexpr long kLogBufferSize = 256 * 1024; // ask logd for a larger buffer to cut dropped reads
+
+// Marker restoring the old full-fidelity files (V/D included), for a session that needs them.
+constexpr char kVerboseMarker[] = "/log-verbose";
+
+// Whether a line of this level earns the bytes on disk. Everything reaches the ring the WebUI
+// polls; the files are a different audience — a crash's context, a bug report, and, on a device
+// that scans the module directory, someone else's read. Verbose and debug are the bulk of the
+// volume and describe operations the panel already shows live, so only info and above persist.
+bool Persist(char level, bool verbose) { return verbose || (level != 'V' && level != 'D'); }
 
 // The injected keystore/keystore2 pid (set from Kotlin by the Injector); -1 when none is live. Its
 // lines are kept so the Logs panel shows what happens inside the process we hook, not only our own.
@@ -105,6 +120,10 @@ private:
     void OnCrash(int ret);
 
     std::string dir_;
+    // True when <dir>/log-verbose exists: the files then keep every level, as they always did.
+    // Otherwise only what survives a level cut goes to disk (see Persist); the ring is unaffected,
+    // so the Logs panel still shows everything live.
+    bool verbose_ = false;
     // Wall-clock ms at which the daemon started, passed in from Kotlin. The first attach asks logd
     // for everything since this instant — see Run().
     int64_t since_ms_;
@@ -129,6 +148,27 @@ void Logcat::OpenCurrent() {
     if (fd_ >= 0) {
         struct stat st{};
         if (fstat(fd_, &st) == 0) written_ = static_cast<size_t>(st.st_size);
+    }
+    // A device upgrading from the old budget carries parts this build would never create; drop them
+    // so the directory shrinks on the first start rather than after enough new lines to rotate.
+    for (int i = kMaxParts + 1; i <= 8; ++i) {
+        char p[PATH_MAX];
+        snprintf(p, sizeof(p), "%s/teesim.%d.log", dir_.c_str(), i);
+        unlink(p);
+    }
+    // Parts written under the old 2 MB budget are oversized for this one, and rotation would need
+    // several passes to age them out — the directory stays at the size that made a scanner time out
+    // in the meantime. Start this boot's history clean instead.
+    if (written_ > kMaxLogSize) {
+        if (fd_ >= 0) close(fd_);
+        for (int i = 1; i <= kMaxParts; ++i) {
+            char p[PATH_MAX];
+            snprintf(p, sizeof(p), "%s/teesim.%d.log", dir_.c_str(), i);
+            unlink(p);
+        }
+        unlink(path.c_str());
+        fd_ = open(path.c_str(), O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0600);
+        written_ = 0;
     }
 }
 
@@ -319,7 +359,10 @@ void Logcat::Process(struct log_msg* buf) {
     line.append(": ");
     line.append(msg);
 
-    WriteLine(line);
+    // The ring keeps everything, so the live Logs panel is unchanged. The files are for whoever
+    // reads them later, and that reader may be a scanner paying to walk the module directory: keep
+    // the level that identifies a failure and let the verbose half stay in memory.
+    if (Persist(level, verbose_)) WriteLine(line);
     RingPush(level, tag, line);
 }
 
@@ -346,6 +389,7 @@ void Logcat::OnCrash(int ret) {
 }
 
 void Logcat::Run() {
+    verbose_ = access((dir_ + kVerboseMarker).c_str(), F_OK) == 0;
     OpenCurrent();
     RotateIfNewBoot();
     // The first attach asks logd for a time WINDOW, not a line count, because neither count works.
