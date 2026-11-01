@@ -18,10 +18,12 @@ import java.io.File
  * reader filters at the source and captures nothing under its own identity, so there is no feedback
  * path to spin on.
  *
- * There is no level cutoff here: the emitter (common/log_context.cpp) has no floor either, so
- * everything it sends to logd is kept in full. Filtering by level is the WebUI's display concern,
- * applied once over the whole retained stream, so a viewer asking for Verbose sees all of it.
- * Volume is reduced only by the emitter's rate limiter (RateOk), never by level.
+ * The emitter (common/log_context.cpp) has no floor, so everything it sends to logd reaches the
+ * in-memory ring in full: filtering by level is the WebUI's display concern, applied once over the
+ * whole retained stream, so a viewer asking for Verbose sees all of it. The rotating files are a
+ * narrower audience — a crash's context, a bug report, and anything on the device that walks the
+ * module directory — so the native writer persists only info and above unless a `log-verbose`
+ * marker sits next to them. Volume is otherwise reduced by the emitter's rate limiter (RateOk).
  */
 object LogTail {
 
